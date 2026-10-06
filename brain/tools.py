@@ -386,8 +386,21 @@ def t_read_thread(env, args, cfg, db):
 
 def t_schedule(env, args, cfg, db):
     fire = time.time() + float(args["minutes"]) * 60
-    db.add_timer(fire, env["channel"], args["message"])
+    db.add_timer(fire, env["channel"], args["message"],
+                 tier=env["tier"], sender=env["sender"])
     return f"scheduled for {args['minutes']} min from now"
+
+
+def timer_envelope(t: dict, language: str) -> dict:
+    """A due timer fires at the tier of whoever scheduled it, never higher.
+    Rows from before tiers were recorded fire as the most restrictive tier."""
+    tier = t.get("tier") if t.get("tier") in RING and t.get("tier") != AGENT \
+        else "unknown"
+    who = t.get("sender") or "unknown sender"
+    return dict(channel=t["channel"], sender=f"timer set by {who}", tier=tier,
+                provider_id=f"timer:{t['id']}",
+                text=f"[reminder due] Deliver this reminder now, in {language}, "
+                     f"on this channel: {t['message']}")
 
 
 # -- calendar (external script, see README "Calendar") ------------------------

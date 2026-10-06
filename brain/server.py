@@ -18,7 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import config, inbox
+from . import config, inbox, tools
 from .db import DB
 
 cfg = config.load()
@@ -91,11 +91,7 @@ def timer_loop():
     while True:
         time.sleep(10)
         for t in db.due_timers():
-            brain.submit(dict(channel=t["channel"], sender="timer (internal)",
-                              tier="owner", provider_id=f"timer:{t['id']}",
-                              text=f"[TIMER FIRED] Deliver this reminder now, "
-                                   f"in {cfg['language']}, on this channel: "
-                                   f"{t['message']}"))
+            brain.submit(tools.timer_envelope(t, cfg["language"]))
             db.finish_timer(t["id"])
 
 

@@ -196,5 +196,51 @@ class AutocompactTests(unittest.TestCase):
             cfg_with("[limits]\nwindow_turns = 40\nauto_compact_turns = 40\n")
 
 
+class TimerTierTests(unittest.TestCase):
+    def setUp(self):
+        from brain.db import DB
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = DB(os.path.join(self.tmp.name, "b.db"))
+        self.cfg = cfg_with()
+
+    def fire(self, env):
+        tools.t_schedule(env, {"minutes": -1, "message": "check"}, self.cfg, self.db)
+        (t,) = self.db.due_timers()
+        return tools.timer_envelope(t, "English")
+
+    def names(self, tier):
+        return {t["name"] for t in tools.schema_for(tier, self.cfg)}
+
+    def test_family_timer_fires_as_family(self):
+        e = self.fire({"channel": "wpp:bob", "sender": "Bob", "tier": "family"})
+        self.assertEqual((e["tier"], e["sender"]), ("family", "timer set by Bob"))
+        self.assertNotIn("remember", self.names(e["tier"]))
+
+    def test_owner_timer_fires_as_owner(self):
+        e = self.fire({"channel": "cli", "sender": "Ada", "tier": "owner"})
+        self.assertEqual(e["tier"], "owner")
+
+    def test_legacy_row_fires_as_unknown(self):
+        import time
+        self.db.conn.execute("INSERT INTO timers (fire_ts, channel, message) "
+                             "VALUES (?,?,?)", (time.time() - 1, "cli", "old"))
+        (t,) = self.db.due_timers()
+        e = tools.timer_envelope(t, "English")
+        self.assertEqual(e["tier"], "unknown")
+        self.assertEqual(e["sender"], "timer set by unknown sender")
+
+    def test_schema_upgrade_adds_columns(self):
+        import sqlite3
+        from brain.db import DB
+        path = os.path.join(self.tmp.name, "old.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE timers (id INTEGER PRIMARY KEY, fire_ts REAL, "
+                  "channel TEXT, message TEXT, done INTEGER DEFAULT 0)")
+        c.commit(); c.close()
+        cols = {r[1] for r in DB(path).conn.execute("PRAGMA table_info(timers)")}
+        self.assertTrue({"tier", "sender"} <= cols)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -42,6 +42,10 @@ class DB:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(messages)")}
         if "tier" not in cols:   # older databases
             self.conn.execute("ALTER TABLE messages ADD COLUMN tier TEXT DEFAULT ''")
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(timers)")}
+        for col in ("tier", "sender"):   # who scheduled it; '' on older rows
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE timers ADD COLUMN {col} TEXT DEFAULT ''")
 
     # -- traces ------------------------------------------------------------
     def step(self, turn_id: str, step: str, channel: str = "", model: str = "",
@@ -109,17 +113,19 @@ class DB:
         return out
 
     # -- timers ------------------------------------------------------------
-    def add_timer(self, fire_ts: float, channel: str, message: str):
+    def add_timer(self, fire_ts: float, channel: str, message: str,
+                  tier: str = "", sender: str = ""):
         self.conn.execute(
-            "INSERT INTO timers (fire_ts, channel, message) VALUES (?,?,?)",
-            (fire_ts, channel, message))
+            "INSERT INTO timers (fire_ts, channel, message, tier, sender) "
+            "VALUES (?,?,?,?,?)", (fire_ts, channel, message, tier, sender))
         self.conn.commit()
 
     def due_timers(self) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT id, channel, message FROM timers WHERE done=0 AND fire_ts<=?",
-            (time.time(),)).fetchall()
-        return [dict(id=r[0], channel=r[1], message=r[2]) for r in rows]
+            "SELECT id, channel, message, tier, sender FROM timers "
+            "WHERE done=0 AND fire_ts<=?", (time.time(),)).fetchall()
+        return [dict(id=r[0], channel=r[1], message=r[2], tier=r[3] or "",
+                     sender=r[4] or "") for r in rows]
 
     def finish_timer(self, timer_id: int):
         self.conn.execute("UPDATE timers SET done=1 WHERE id=?", (timer_id,))
