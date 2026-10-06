@@ -1,0 +1,28 @@
+# local config and secrets
+config.toml
+.env
+*.pem
+*.key
+
+# runtime state: db, memory, identity, logs (all under data/)
+data/
+
+# WhatsApp: session credentials and the real contact book
+wa/auth/
+wa/auth*/
+wa/allow.json
+
+# environments, deps, caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+
+# logs, backups, editor junk
+*.log
+*.bak
+*.bak-*
+*.orig
+*.swp
+.DS_Store

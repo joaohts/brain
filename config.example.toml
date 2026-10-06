@@ -1,0 +1,58 @@
+# brain configuration. install.sh copies this to config.toml (git-ignored);
+# edit config.toml, never this file. Secrets (OPENAI_API_KEY) go in .env.
+# Relative paths are relative to the repo root; ~ is expanded.
+# Check it with: .venv/bin/python -m brain.config
+
+[agent]
+assistant_name = "Assistant"        # what the agent calls itself
+owner_name = "Owner"                # the person it works for (tier "owner")
+language = "English"                # default reply language (identity_file can override)
+timezone = "UTC"                    # IANA name, used by the calendar integration
+identity_file = "data/identity.md"  # system prompt / persona (install.sh seeds it)
+memory_dir = "data/memory"          # *.md files loaded as durable memory
+db_path = "data/brain.db"           # traces, threads, timers
+
+[model]
+name = "gpt-6-luna"                 # OpenAI Responses API model
+price_in_per_mtok = 0.10            # USD per 1M input tokens (cost tracking)
+price_out_per_mtok = 0.50           # USD per 1M output tokens
+reasoning_effort = "medium"         # none / low / medium / high, every model call
+daily_budget_usd = 1.0              # refuse new turns past this spend; 0 = no cap
+
+[limits]
+max_tool_steps = 6
+window_turns = 20
+auto_compact_turns = 40
+blackboard_hours = 4
+blackboard_max_lines = 12
+
+[server]
+host = "127.0.0.1"                  # keep it on localhost: /turn has no auth
+port = 3401
+
+# ---- optional integrations: all off by default -----------------------------
+
+[whatsapp]                          # wa/ sidecar (Baileys), service brain-wa
+enabled = false
+port = 3402                         # sidecar's local /send endpoint
+contacts_file = "wa/allow.json"     # allowlist + contact book (copy allow.example.json)
+auth_dir = "wa/auth"                # Baileys session; created on first QR scan
+transcribe_model = "whisper-1"      # voice notes -> text
+vision_model = "gpt-5-mini"         # images / PDFs -> text (in [agent] language)
+transcribe_language = ""            # ISO-639-1 hint for voice notes, e.g. "en"; "" = auto
+
+[comms]                             # comms node channel (brain/comms_v1.py)
+enabled = false
+socket = "~/.local/share/comms/node.sock"
+alias = "brain"                     # persistent comms identity
+trusted_machines = []               # machine IDs whose agents get tier "owner"
+state_path = "data/comms-v1/adapter.db"
+
+[calendar]                          # calendar_* tools via an external script
+enabled = false
+script = ""                         # executable implementing the contract in README
+
+[claude_sessions]                   # claude_spawn/list/kill tools (needs comms, tmux, claude)
+enabled = false
+script = "scripts/claude-sessions.sh"
+source = "brain"                    # session-name prefix

@@ -1,0 +1,13 @@
+[Unit]
+Description=brain: WhatsApp sidecar (Baileys)
+After=network-online.target brain.service
+
+[Service]
+ExecStart=/bin/bash @INSTALL_DIR@/run-wa.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:@INSTALL_DIR@/data/wa.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=brain: personal agent loop (HTTP /turn on localhost)
+After=network-online.target
+
+[Service]
+ExecStart=/bin/bash @INSTALL_DIR@/run-brain.sh
+Restart=always
+RestartSec=3
+StandardOutput=append:@INSTALL_DIR@/data/brain.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

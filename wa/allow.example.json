@@ -1,0 +1,5 @@
+{
+  "<owner-number>@s.whatsapp.net": {"alias": "owner", "name": "Owner", "number": "<owner-number>", "tier": "owner"},
+  "<owner-lid>@lid": {"alias": "owner", "name": "Owner", "number": "<owner-number>", "tier": "owner"},
+  "<friend-lid>@lid": {"alias": "alice", "name": "Alice", "number": "<friend-number>", "tier": "family"}
+}
