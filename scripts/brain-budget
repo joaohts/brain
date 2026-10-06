@@ -1,0 +1,5 @@
+#!/bin/sh
+# Spending caps CLI for local agents and the owner: brain-budget --help
+# (brain/budget_cli.py). Symlink it onto PATH: ln -s "$PWD/scripts/brain-budget" ~/.local/bin/
+here=$(dirname "$(readlink -f "$0")")
+cd "$here/.." && exec .venv/bin/python -m brain.budget_cli "$@"

@@ -809,7 +809,47 @@ def t_vault_edit(env, args, cfg, db):
                        args.get("base_sha256", ""), write=True)
 
 
+# -- budget (brain/budget.py) ----------------------------------------------------
+# Owner only (ring 2, not agent=True). Changing a cap also needs the owner's own
+# WhatsApp or the local cli (budget.may_change): owner-tier comms peers read only.
+
+def t_budget(env, args, cfg, db):
+    from . import budget
+    action = args.get("action") or "status"
+    if action == "status":
+        return budget.status_text(cfg, db)
+    if env.get("tier") != "owner" or not budget.may_change(env):
+        db.step(env.get("turn_id", ""), "policy_denial", channel=env["channel"],
+                tool="budget", sender=env["sender"], action=action)
+        return ("denied by policy: budget changes come only from the owner's "
+                "own WhatsApp or the local cli; status is allowed")
+    period = args.get("period")
+    if action == "set":
+        cmd = ("set", period, str(args.get("value", "")))
+    elif action == "cancel":
+        cmd = ("cancel", period)
+    else:
+        return f"unknown action: {action}"
+    return budget.run_command(cfg, db, cmd, env, source="tool")
+
+
 TOOLS = [
+    dict(name="budget", ring=2, fn=t_budget,
+         description="Spending caps: status (spent, effective cap, base, "
+                     "temporary raise and when it expires, for the daily and "
+                     "weekly caps), or a temporary change asked by {owner}: "
+                     "set the day cap until the next midnight or the week cap "
+                     "until next Monday 00:00 ({tz}), or cancel it. The base "
+                     "in the config never changes. Use only when {owner} "
+                     "asks in this conversation.",
+         parameters={"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["status", "set", "cancel"]},
+             "period": {"type": "string", "enum": ["day", "week"]},
+             "value": {"type": "string",
+                       "description": "for set: an amount in USD (\"5\") or "
+                                      "an increment on the current cap "
+                                      "(\"+2\")"}},
+             "required": ["action"]}),
     dict(name="remember", ring=2, fn=t_remember,
          description="Saves a lasting fact to durable memory, attributed to "
                      "the speaker.",

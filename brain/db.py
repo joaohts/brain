@@ -39,6 +39,8 @@ class DB:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        from .budget import SCHEMA as BUDGET_SCHEMA   # overrides + alerts
+        self.conn.executescript(BUDGET_SCHEMA)
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(messages)")}
         if "tier" not in cols:   # older databases
             self.conn.execute("ALTER TABLE messages ADD COLUMN tier TEXT DEFAULT ''")

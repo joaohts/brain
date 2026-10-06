@@ -20,6 +20,9 @@ reasoning_effort = "medium"         # none / low / medium / high, every model ca
 daily_budget_usd = 1.0              # hold new turns past this spend per day; 0 = no cap
 weekly_budget_usd = 0.0             # same per week (Monday 00:00); 0 = no cap
                                     # days and weeks follow [agent] timezone
+budget_alert_channel = ""           # 80%/100% alerts; "" = owner's WhatsApp contact
+budget_cli_max_daily_usd = 0.0      # highest temporary cap brain-budget (agent CLI)
+budget_cli_max_weekly_usd = 0.0     # may set; 0 = the CLI can't raise the caps
 
 [limits]
 max_tool_steps = 6
@@ -34,7 +37,7 @@ port = 3401
 
 [messages]                          # fixed replies sent without a model call;
                                     # write them in [agent] language
-budget_reached = "I've reached my {period} spending limit (US$ {limit}). Your messages are saved and I'll answer them when it resets ({resets}). {owner} can raise daily_budget_usd or weekly_budget_usd."
+budget_reached = "I've reached my {period} spending limit (US$ {limit}). Your messages are saved and I'll answer them when it resets ({resets}). {owner} can raise it for now with \"budget today N\" or \"budget week N\"."
 out_of_steps = "I ran out of steps before finishing this: {request}"
 failure = "Something failed on my side before I could answer: {request}"
 

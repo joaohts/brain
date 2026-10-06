@@ -85,7 +85,55 @@ without `--enable`. To keep the services running without a login session, run
   already running finishes): messages are held in the inbox, the sender gets
   `budget_reached` once per channel per cap period, and the held messages are
   answered in order, replies pushed to their channel, as soon as spend is
-  back under both caps (period rollover, or a raised cap and a restart).
+  back under both caps (period rollover or a raised cap, no restart needed).
+  See [Spending caps](#spending-caps) for alerts, temporary raises and the
+  agent CLI.
+
+## Spending caps
+
+`brain/budget.py` is the one API; three doors use it.
+
+- **Alerts, no model call.** Crossing 80% and reaching 100% of each cap
+  sends one plain message to `budget_alert_channel` (default: the owner's
+  WhatsApp). Each alert goes once per (cap, period, threshold, effective
+  cap), so raising a cap re-arms them against the new value. When the other
+  cap will stop turns first, the alert says so. Checked after every turn
+  and on the 2 s ticker.
+- **Temporary raises.** A row in `budget_overrides` (brain DB) replaces a
+  base cap for the rest of the current period only: daily until the next
+  local midnight, weekly until next Monday 00:00. `config.toml` is never
+  edited. The effective cap is read at every check, so a change applies at
+  once, survives a restart and expires by itself; held messages are then
+  answered in order if both caps allow. Rows are never deleted (cancel
+  stamps them), so `brain-budget log` is the audit trail: value, expiry,
+  source, who, why. A permanent change is still a config edit and restart.
+- **Owner commands** (answered by the dispatcher before the cap check,
+  so they work while messages are held; no model call): `orçamento` (status),
+  `orçamento hoje 5`, `orçamento hoje +2`, `orçamento semana 15`,
+  `orçamento cancelar hoje|semana` (also `budget today|week N`). Only an
+  owner-tier message from a `wpp:` channel or `cli` runs one; the tier comes
+  from the WhatsApp allowlist or the local door, never from the text. Family,
+  unknown, agent turns and owner-tier comms peers get no change: their
+  message is an ordinary one. Outside a cap the owner can also ask in natural
+  language: the owner-only `budget` tool (status / set / cancel, same rule).
+- **Agent CLI** `scripts/brain-budget` (symlinked as `~/.local/bin/brain-budget`):
+
+  ```sh
+  brain-budget status [--json]                    # spend, effective caps, overrides
+  brain-budget set day 5 --by NAME --reason WHY   # until next local midnight
+  brain-budget set day +2 --by NAME --reason WHY  # on top of the current cap
+  brain-budget set week 15 --by NAME              # until next Monday 00:00
+  brain-budget cancel day|week --by NAME
+  brain-budget log [--limit N] [--json]           # audit trail
+  ```
+
+  Exit 0 ok, 1 refused, 2 usage. Limits on this door: it can't set a cap
+  above `budget_cli_max_daily_usd` / `budget_cli_max_weekly_usd` (0 = no
+  raises), it can't replace or cancel an override the owner set, `--by` is
+  required and stored with the OS user and parent process, and the owner
+  gets a WhatsApp notice of every CLI change with how to undo it. It is a
+  local door: anything running as this OS user can use it, as it can the
+  database and `/turn`.
 
 ## Message handling
 
@@ -158,6 +206,8 @@ clear message.
 | | `reasoning_effort` | `medium` | passed on every model call |
 | | `daily_budget_usd` | `1.0` | spend cap per local day; `0` disables it |
 | | `weekly_budget_usd` | `0.0` | spend cap per local week (Monday 00:00); `0` disables it |
+| | `budget_alert_channel` | `""` | where 80%/100% alerts go; `""` = the owner's WhatsApp contact, if any |
+| | `budget_cli_max_daily_usd` / `budget_cli_max_weekly_usd` | `0.0` / `0.0` | highest temporary cap `brain-budget` may set; `0` = the CLI can't raise |
 | `[limits]` | `max_tool_steps`, `window_turns`, `auto_compact_turns`, `blackboard_hours`, `blackboard_max_lines` | 6, 20, 40, 4, 12 | context and loop limits |
 | `[messages]` | `budget_reached`, `out_of_steps`, `failure` | English | fixed replies sent without a model call; write them in your language (`{owner}`, `{request}`; `budget_reached` also `{period}`, `{limit}`, `{spent}`, `{resets}`) |
 | `[server]` | `host` / `port` | `127.0.0.1` / `3401` | the `/turn` API (no auth: keep it on localhost) |
@@ -396,9 +446,10 @@ There's no plugin registry. A channel needs three small pieces:
 
 ```
 brain/            the service: server (HTTP /turn + timers), loop, tools, db,
-                  compact, config, comms_v1, cli
+                  compact, config, comms_v1, cli, budget, budget_cli
 wa/               WhatsApp sidecar (Node, Baileys)
-scripts/          claude-sessions.sh (tmux-managed Claude Code sessions)
+scripts/          claude-sessions.sh (tmux-managed Claude Code sessions),
+                  brain-budget (spending caps CLI for agents)
 deploy/systemd/   unit templates rendered by install.sh
 examples/         identity.example.md
 tests/            python -m unittest discover tests  (sidecar: node --test wa/)

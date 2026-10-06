@@ -38,6 +38,9 @@ DEFAULTS = {
     "reasoning_effort": "medium",
     "daily_budget_usd": 1.0,      # 0 disables the cap; local midnight
     "weekly_budget_usd": 0.0,     # 0 disables the cap; Monday 00:00 local
+    "budget_alert_channel": "",   # 80%/100% alerts; "" = owner's WhatsApp, if any
+    "budget_cli_max_daily_usd": 0.0,    # highest temporary cap the agent CLI
+    "budget_cli_max_weekly_usd": 0.0,   # may set; 0 = the CLI can't raise it
     # [limits]
     "max_tool_steps": 6,
     "window_turns": 20,           # tool-trace rows share the window with real turns
@@ -98,8 +101,8 @@ INTEGRATIONS = {
 MESSAGES = {
     "budget_reached": "I've reached my {period} spending limit (US$ {limit}). "
                       "Your messages are saved and I'll answer them when it "
-                      "resets ({resets}). {owner} can raise daily_budget_usd "
-                      "or weekly_budget_usd.",
+                      "resets ({resets}). {owner} can raise it for now with "
+                      "\"budget today N\" or \"budget week N\".",
     "out_of_steps": "I ran out of steps before finishing this: {request}",
     "failure": "Something failed on my side before I could answer: {request}",
 }
@@ -181,7 +184,8 @@ def validate(cfg) -> None:
     if not 0 < cfg["window_turns"] < cfg["auto_compact_turns"]:
         raise ConfigError("[limits] window_turns must be > 0 and smaller than "
                           "auto_compact_turns (otherwise every turn compacts)")
-    for k in ("daily_budget_usd", "weekly_budget_usd"):
+    for k in ("daily_budget_usd", "weekly_budget_usd",
+              "budget_cli_max_daily_usd", "budget_cli_max_weekly_usd"):
         if not isinstance(cfg[k], (int, float)) or cfg[k] < 0:
             raise ConfigError(f"[model] {k} must be a number >= 0 (0 = no cap)")
     if enabled(cfg, "whatsapp"):

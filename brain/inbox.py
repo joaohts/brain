@@ -32,7 +32,14 @@ something gets answered.
   transaction, a copy is stored in state `held`, addressed to the row's
   origin channel. Once spend is back under every cap the held copies become
   unread again, oldest first, and their replies are delivered to that
-  channel. A turn already running is never cut short by a cap.
+  channel. A turn already running is never cut short by a cap. The notice
+  is keyed by cap, period and effective limit, so a raised cap reached
+  again in the same period is announced again.
+- Owner budget commands ("orçamento", "orçamento hoje 5", ...; see
+  brain/budget.py) are answered by the dispatcher itself, before the cap
+  check and without a model call, so they work while a cap holds messages.
+  A running turn never merges one; it waits for its own dispatch. After
+  every turn and on every tick, the 80%/100% alerts are checked.
 """
 
 from __future__ import annotations
@@ -213,10 +220,13 @@ class Store:
                 "SELECT * FROM inbox WHERE state='unread' AND channel=? AND "
                 "thread=? AND (sender=? OR kind='worker_result') ORDER BY id "
                 "LIMIT ?", (channel, thread, sender, max_msgs)).fetchall()
+            from .budget import parse_command
             taken, chars = [], 0
             for r in rows:
                 if taken and chars + len(r["text"]) > max_chars:
                     break
+                if r["kind"] == "message" and parse_command(r["text"]):
+                    break   # a budget command gets its own dispatch
                 taken.append(r)
                 chars += len(r["text"])
             c.executemany(
@@ -550,6 +560,7 @@ class Brain:
                 while not self._stop.wait(tick):
                     try:
                         self.resume_held()
+                        self.budget_alerts()
                     except Exception as e:
                         self.db.step("", "budget_error",
                                      error=f"{type(e).__name__}: {e}")
@@ -647,6 +658,8 @@ class Brain:
                         return
                     if not self.store.claim_lease(self.holder, self.lease_seconds):
                         return
+                if self._command(row):
+                    continue
                 from . import budget
                 cap = budget.reached(self.cfg, self.db)
                 if cap:
@@ -675,12 +688,50 @@ class Brain:
             self.kick()
         return n
 
+    def budget_alerts(self):
+        """80%/100% alerts to the owner, plain text, no model call."""
+        from . import budget
+        budget.send_alerts(self.cfg, self.db)
+
+    def _command(self, row: dict) -> bool:
+        """An owner budget command: apply it and answer the row directly
+        (brain/budget.py). False when `row` is not one this sender may run;
+        it then goes the normal way (a turn, or held at a cap)."""
+        from . import budget
+        cmd = budget.parse_command(row["text"]) if row["kind"] == "message" \
+            else None
+        env = {"channel": row["channel"], "sender": row["sender"],
+               "tier": row["tier"], "kind": row["kind"]}
+        if not cmd or not budget.may_change(env):
+            return False
+        turn_id = f"t_{uuid.uuid4().hex[:10]}"
+        self.store.mark_read([row["id"]], turn_id, self.holder)
+        try:
+            reply, error = budget.run_command(self.cfg, self.db, cmd, env), None
+        except Exception as e:
+            reply, error = None, f"{type(e).__name__}: {e}"
+        self.db.step(turn_id, "budget_command", channel=row["channel"],
+                     sender=row["sender"], command=list(cmd), error=error)
+        # the thread keeps it, so later turns know what was decided
+        self.db.add_message(row["channel"], "user", row["sender"], row["text"],
+                            row["tier"])
+        if reply:
+            self.db.add_message(row["channel"], "assistant",
+                                self.cfg["assistant_name"], reply)
+        self._complete(row, reply, error, turn_id)
+        with self._changed:
+            self._changed.notify_all()
+        if cmd[0] != "status":
+            self.resume_held()
+            self.budget_alerts()
+        return True
+
     def _hold(self, row: dict, cap: dict):
         """A spending cap is reached: keep `row` for later (Store.hold) and
         tell its sender once per channel per cap period."""
         from . import budget
         from .config import message
-        period = f"{cap['period']}:{int(cap['start'])}"
+        period = budget.notice_key(cap)
         notice = message(self.cfg, "budget_reached",
                          **budget.describe(self.cfg, cap))
         held = self.store.hold(row, period, notice)
@@ -749,6 +800,10 @@ class Brain:
             self._complete(row, reply if is_head else "", error, turn_id)
         with self._changed:
             self._changed.notify_all()
+        try:
+            self.budget_alerts()
+        except Exception as e:
+            self.db.step(turn_id, "budget_error", error=f"{type(e).__name__}: {e}")
 
     def _complete(self, row: dict, reply: str | None, error: str | None,
                   turn_id: str):
