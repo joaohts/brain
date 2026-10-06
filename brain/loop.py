@@ -173,6 +173,10 @@ def _run(env, cfg, db, client, pull=None, renew=None, turn_id=None):
     return final
 
 
+_compacting: set[str] = set()     # channels with a compaction in flight
+_compacting_guard = threading.Lock()
+
+
 def _maybe_autocompact(channel: str, cfg, db):
     """If a thread outgrows the limit, compact its older half in the background
     (same compact_channel the nightly cron uses — one mechanism, two triggers)."""
@@ -181,13 +185,20 @@ def _maybe_autocompact(channel: str, cfg, db):
                         (channel,)).fetchone()[0]
     if n <= limit:
         return
-    keep = cfg["window_turns"] * 2
+    # compact down to the newest window_turns rows, so the next compaction
+    # comes only after the thread grows past auto_compact_turns again
+    keep = cfg["window_turns"]
     row = db.conn.execute(
         "SELECT ts FROM messages WHERE channel=? ORDER BY ts DESC "
         "LIMIT 1 OFFSET ?", (channel, keep - 1)).fetchone()
     if not row:
         return
     cutoff = row[0]
+
+    with _compacting_guard:
+        if channel in _compacting:
+            return
+        _compacting.add(channel)
 
     def job():
         from .compact import compact_channel
@@ -198,5 +209,8 @@ def _maybe_autocompact(channel: str, cfg, db):
                             OpenAI(api_key=api_key()))
         except Exception as e:
             print(f"[autocompact] {channel}: {e}")
+        finally:
+            with _compacting_guard:
+                _compacting.discard(channel)
 
     threading.Thread(target=job, daemon=True).start()

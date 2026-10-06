@@ -143,5 +143,54 @@ class PrivacyTests(unittest.TestCase):
         self.assertIn("denied by policy", out)
 
 
+class AutocompactTests(unittest.TestCase):
+    def test_compacts_to_window_then_waits_for_threshold(self):
+        import threading
+        from unittest import mock
+        from types import SimpleNamespace as NS
+        from brain import loop
+        from brain.db import DB
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = cfg_with(f'[agent]\nmemory_dir = "{tmp.name}"\n'
+                       f'db_path = "{tmp.name}/b.db"\n')
+        db = DB(cfg["db_path"])
+        usage = NS(input_tokens=1, output_tokens=1, output_tokens_details=None)
+        calls = []
+
+        def create(**kw):
+            calls.append(kw)
+            return NS(output_text='{"summary": "s", "facts": []}', usage=usage)
+
+        fake = NS(responses=NS(create=create))
+        count = lambda: db.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE channel='cli'").fetchone()[0]
+
+        def run():
+            loop._maybe_autocompact("cli", cfg, db)
+            for t in threading.enumerate():
+                if t is not threading.main_thread() and t.daemon:
+                    t.join(5)
+
+        with mock.patch.object(loop, "OpenAI", lambda **kw: fake), \
+             mock.patch.object(loop, "api_key", lambda: "k", create=True):
+            for i in range(41):
+                db.add_message("cli", "user", "a", f"m{i}")
+            run()
+            self.assertEqual(count(), cfg["window_turns"])
+            self.assertEqual(len(calls), 1)
+            for i in range(cfg["auto_compact_turns"] - cfg["window_turns"]):
+                db.add_message("cli", "user", "a", f"n{i}")
+                run()
+            self.assertEqual(len(calls), 1)          # at the threshold, not over
+            db.add_message("cli", "user", "a", "over")
+            run()
+            self.assertEqual(len(calls), 2)
+
+    def test_window_must_be_below_threshold(self):
+        with self.assertRaises(config.ConfigError):
+            cfg_with("[limits]\nwindow_turns = 40\nauto_compact_turns = 40\n")
+
+
 if __name__ == "__main__":
     unittest.main()

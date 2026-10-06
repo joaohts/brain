@@ -155,6 +155,9 @@ def enabled(cfg, name: str) -> bool:
 def validate(cfg) -> None:
     """Fail loud for enabled-but-broken integrations; disabled ones are inert."""
     import re
+    if not 0 < cfg["window_turns"] < cfg["auto_compact_turns"]:
+        raise ConfigError("[limits] window_turns must be > 0 and smaller than "
+                          "auto_compact_turns (otherwise every turn compacts)")
     if enabled(cfg, "whatsapp"):
         f = cfg["whatsapp"]["contacts_file"]
         if not os.path.isfile(f):
