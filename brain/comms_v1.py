@@ -518,9 +518,11 @@ class BrainComms:
             self.journal.ack_result(job, "pending", 1000)
 
     def send(self, target, body, message_id=None):
+        """target: a local alias, a <peer>:<alias> address, or an exact
+        <machine_id>:<agent_id> recipient."""
         parts = target.split(":")
-        if len(parts) != 2 or any(not ID.fullmatch(p) for p in parts):
-            raise NodeError(400, "invalid_exact_destination")
+        if len(parts) not in (1, 2) or any(not ID.fullmatch(p) for p in parts):
+            raise NodeError(400, "invalid_destination")
         if not isinstance(body, str) or len(body.encode()) > MAX_BODY:
             raise NodeError(413, "message_too_large")
         opened = self.attach()
@@ -532,6 +534,33 @@ class BrainComms:
             if exc.status in (403, 410) and exc.code in ("no_attachment", "attachment_ended"):
                 self._forget_attachment()
             raise
+
+    # -- read-only inspection (never consumes mail) --------------------------
+    def who(self):
+        return self.client.request("GET", "/v1/who")
+
+    def message_status(self, message_id):
+        if not ID.fullmatch(message_id or ""):
+            raise NodeError(400, "invalid_message_id")
+        return self.client.request("GET", f"/v1/messages/{quote(message_id, safe='')}")
+
+    def history(self, peer=None, limit=20, cursor=None, pending=False):
+        """POST /v1/history: this identity's mail (peer=None), or the thread
+        with a peer address / exact id. pending=True is the unread inbox."""
+        opened = self.attach()
+        query = {"session_id": opened["session"]["id"],
+                 "target": peer or opened["agent"]["id"],
+                 "limit": max(1, min(int(limit or 20), 50))}
+        if cursor:
+            query["cursor"] = cursor
+        if pending:
+            query["pending"] = True
+        return self.client.request("POST", "/v1/history", query)
+
+    def identity(self):
+        """'<node name>:<alias>', how peers address this brain."""
+        name = self.client.request("GET", "/v1/status").get("name", "")
+        return f"{name}:{self.alias}" if name else self.alias
 
     def _control_loop(self):
         while not self.stop.is_set():
@@ -583,19 +612,49 @@ def start(run_turn, cfg, db):
         return _active
 
 
-def deliver(target, message):
-    """Tools hook: structured result, no CLI scraping or implicit sender alias."""
+def _bridge():
     with _active_guard:
         bridge = _active
     if bridge is None or bridge.stop.is_set():
+        return None
+    return bridge
+
+
+def _call(fn):
+    """Run one node call; structured result, never raises into a tool."""
+    if _bridge() is None:
         return {"ok": False, "error": "comms-v1 is not enabled"}
     try:
-        result = bridge.send(target, message)
-        return {"ok": True, "id": result["id"], "state": result["state"]}
+        return {"ok": True, "result": fn(_bridge())}
     except NodeError as exc:
-        return {"ok": False, "error": "comms-v1 unavailable: " + exc.code}
+        return {"ok": False, "error": "comms-v1: " + exc.code}
     except (OSError, http.client.HTTPException):
         return {"ok": False, "error": "comms-v1 unavailable: node_unavailable"}
+
+
+def deliver(target, message):
+    """The single comms send path (send_to and replies' tools hook): returns
+    the node's real message id and state."""
+    r = _call(lambda b: b.send(target, message))
+    if not r["ok"]:
+        return r
+    return {"ok": True, "id": r["result"]["id"], "state": r["result"]["state"]}
+
+
+def who():
+    return _call(lambda b: b.who())
+
+
+def message_status(message_id):
+    return _call(lambda b: b.message_status(message_id))
+
+
+def history(peer=None, limit=20, cursor=None, pending=False):
+    return _call(lambda b: b.history(peer, limit, cursor, pending))
+
+
+def identity():
+    return _call(lambda b: b.identity())
 
 
 def status_file(path):

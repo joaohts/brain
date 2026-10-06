@@ -14,8 +14,8 @@ import uuid
 
 from openai import OpenAI
 
-from . import tools
-from .config import api_key
+from . import prompts, tools
+from .config import api_key, enabled
 from .db import DB
 from .inbox import MAX_DRAFT_DISCARDS
 
@@ -102,6 +102,11 @@ def _run(env, cfg, db, client, pull=None, renew=None, turn_id=None):
                    "mind, the channels are mouths; whoever speaks there is "
                    "also you. Use read_thread to see more of any of them.\n"
                    + "\n".join(board))
+    if enabled(cfg, "comms"):
+        from . import comms_v1
+        ident = comms_v1.identity()
+        system += "\n\n" + prompts.comms_guide(
+            cfg, ident["result"] if ident["ok"] else None)
     pending_cal = tools.calendar_pending(env["channel"])
     if pending_cal:
         system += ("\n\n## Pending calendar change (staged, NOT executed)\n"
