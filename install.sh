@@ -40,7 +40,11 @@ python3 -c 'import venv, ensurepip' 2>/dev/null \
 [ -d "$HOME/.local/node/current/bin" ] && PATH="$HOME/.local/node/current/bin:$PATH"
 NODE_OK=0
 if have node && have npm; then
-  NODE_OK=1
+  if [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 20 ]; then
+    NODE_OK=1
+  else
+    warn "node $(node --version) is too old (WhatsApp needs 20+): the WhatsApp sidecar (wa/) will not be installed"
+  fi
 else
   warn "node/npm not found: the WhatsApp sidecar (wa/) will not be installed"
 fi

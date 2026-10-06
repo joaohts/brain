@@ -19,7 +19,7 @@ Each works alone. Together: install **comms** on every machine, **agent-monitor*
 
 ## Quickstart
 
-Needs Python 3.11+, an OpenAI API key, and systemd user services. Node 18+ is
+Needs Python 3.11+, an OpenAI API key, and systemd user services. Node 20+ is
 needed only for WhatsApp.
 
 ```sh
