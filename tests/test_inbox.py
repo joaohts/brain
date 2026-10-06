@@ -570,6 +570,53 @@ class WorkerTests(Base):
         self.wait_reaped()
         self.assertEqual(self.killed, ["w1"])
 
+    def other_managed(self, sessions, sources, later=None):
+        """reap_other_managed with tmux stubbed: sessions {name: activity},
+        sources {name: CLAUDE_SESSION_SOURCE}, later {name: activity seen on
+        the re-read just before the kill}."""
+        from unittest import mock
+        self.cfg["claude_sessions"]["reap_other_managed"] = True
+        later = later or {}
+
+        def activity(target=None):
+            if target is None:
+                return dict(sessions)
+            return {target: later.get(target, sessions[target])}
+        with mock.patch.object(tools, "tmux_activity", activity), \
+             mock.patch.object(tools, "managed_source", sources.get):
+            self.brain.reap_idle(now=self.now)
+        time.sleep(0.1)
+        return sorted(self.killed)
+
+    def test_other_managed_sessions_time_out_by_pane_output(self):
+        self.now = time.time()
+        old, fresh = self.now - self.IDLE - 60, self.now - 60
+        killed = self.other_managed(
+            {"mcp-1": old, "manual-2": old, "mcp-3": fresh,
+             "personal": old, "mcp-unstamped": old},
+            {"mcp-1": "mcp", "manual-2": "manual", "mcp-3": "mcp"})
+        # unstamped tmux sessions are never touched, whatever their name
+        self.assertEqual(killed, ["manual-2", "mcp-1"])
+        reasons = [json.loads(r[0])["reason"] for r in self.steps("worker_reaped")]
+        self.assertIn("inactive, managed by mcp", reasons)
+
+    def test_other_managed_session_with_new_output_since_the_listing_lives(self):
+        self.now = time.time()
+        old = self.now - self.IDLE - 60
+        self.assertEqual(self.other_managed(
+            {"mcp-1": old}, {"mcp-1": "mcp"}, later={"mcp-1": self.now - 1}), [])
+
+    def test_other_managed_is_off_by_default_and_leaves_our_own_alone(self):
+        self.now = time.time()
+        old = self.now - self.IDLE - 60
+        self.cfg["claude_sessions"]["source"] = "brain"
+        self.assertNotIn("reap_other_managed",
+                         {k for k, v in self.cfg["claude_sessions"].items() if v})
+        # ours ("brain-…") are judged by the worker table / own sweep instead
+        self.panes = {}
+        self.assertEqual(self.other_managed({"brain-1": old},
+                                            {"brain-1": "brain"}), [])
+
     def test_pane_activity_reads_only_our_sessions(self):
         from unittest import mock
         out = "joana-1a\t100\njoana-1a\t250\nmcp-9\t300\njoanax\t5\n"

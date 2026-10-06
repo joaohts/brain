@@ -725,6 +725,33 @@ class Brain:
                              reason="inactive, untracked")
                 threading.Thread(target=tools.kill_session,
                                  args=(self.cfg, sid), daemon=True).start()
+        if self.cfg.get("claude_sessions", {}).get("reap_other_managed"):
+            self.reap_other_managed(cutoff)
+
+    def reap_other_managed(self, cutoff: float):
+        """[claude_sessions] reap_other_managed: the same inactivity rule for
+        every other session claude-sessions.sh manages (any source: mcp,
+        manual, ...), judged by pane output alone. A tmux session without
+        its CLAUDE_SESSION_SOURCE stamp is never touched, whatever its name.
+        Its activity is read again just before the kill."""
+        from . import tools
+        seen = tools.tmux_activity()
+        if seen is None:
+            return
+        prefix = tools.own_prefix(self.cfg)
+        for name, at in seen.items():
+            if name.startswith(prefix) or at > cutoff:
+                continue
+            source = tools.managed_source(name)
+            if not source:
+                continue
+            fresh = tools.tmux_activity(name)
+            if fresh is None or not fresh or max(fresh.values()) > cutoff:
+                continue
+            self.db.step("", "worker_reaped", channel="", session=name,
+                         reason=f"inactive, managed by {source}")
+            threading.Thread(target=tools.kill_session,
+                             args=(self.cfg, name), daemon=True).start()
 
     def reap(self, sid: str | None, turn_id: str = ""):
         if sid and self.store.claim_reap(sid):

@@ -269,6 +269,14 @@ it is killed, whether or not it sent a `[FINAL]`. `0` kills a worker as soon
 as its `[FINAL]` reaches the origin; workers that never send one still time
 out after the default 480.
 
+`reap_other_managed = true` holds every other session that
+`claude-sessions.sh` created (whatever its `--source`: e.g. `mcp`, `manual`)
+to the same inactivity limit, judged by pane output alone, in the same
+once-a-minute sweep. A session counts as managed only by the
+`CLAUDE_SESSION_SOURCE` the script stamps on it, never by its name, so
+personal tmux sessions are never touched. Its activity is read again just
+before the kill, and `kill` itself refuses unmanaged sessions.
+
 ### Vault (`[vault]`)
 
 Owner-only tools over a folder of Markdown notes, such as an Obsidian vault:
