@@ -120,12 +120,19 @@ sender's own tier.
   the origin channel. If the origin's own turn is running, the report is
   merged into it; otherwise it starts a turn there. A worker whose report
   starts with `[FINAL]` goes idle once that report has reached the origin:
-  it stays up with its context for `idle_minutes` (default 15) so follow-ups
-  sent to it over comms still work. After that it is reaped. Sending it a
-  follow-up wakes it before the send and cancels the deadline: it is not
-  reaped, however long it works silently, until a new `[FINAL]` answers
-  every follow-up it was sent, which starts a fresh idle period. A
-  progress report also wakes it. `claude_kill` ends one at any time.
+  it stays up with its context so follow-ups sent to it over comms still
+  work. Every worker, idle or not, `[FINAL]` or not, is reaped once it has
+  been **inactive** for `idle_minutes` (default 480, 8 hours); it is not a
+  limit on run time. Activity is its spawn, each report it sends, each
+  follow-up sent to it (a failed send is undone), and any output in its tmux
+  pane (tmux `window_activity`: Claude's spinner and elapsed-time counter
+  redraw while it thinks or runs a tool, and an incoming comms message is
+  drawn too). Looking at the pane is not activity. The inbox ticker sweeps
+  once a minute; if tmux can't be read it reaps nothing. Sessions named
+  after this `source` that the worker table doesn't track as live (spawned
+  before it, or a kill that didn't take) are held to the same rule.
+  Sending a worker a follow-up wakes it before the send; it owes a new
+  `[FINAL]` for it. `claude_kill` ends one at any time.
   When a spawn fails, a `spawn FAILED: …` note lands in the origin
   conversation so the requester is told.
 
@@ -257,8 +264,10 @@ and its `/open-comms` skill. If a spawn can't come up (login expired, claude
 exited, no comms receiver), the tool returns `spawn FAILED: …` quickly instead
 of promising a follow-up.
 
-`idle_minutes` (default 15) is how long a worker lingers after its `[FINAL]`
-report before it is killed; `0` restores the old reap-at-once behaviour.
+`idle_minutes` (default 480) is how long a worker may stay inactive before
+it is killed, whether or not it sent a `[FINAL]`. `0` kills a worker as soon
+as its `[FINAL]` reaches the origin; workers that never send one still time
+out after the default 480.
 
 ### Calendar (`[calendar]`)
 

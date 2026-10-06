@@ -446,6 +446,7 @@ class BrainComms:
         provider_id = f"comms:{machine}:{job['message_id']}"
         worker = self.brain.store.worker_by_recipient(f"{machine}:{agent}")
         if worker:
+            self.brain.store.touch_worker(worker["sid"])   # a report is activity
             env, meta = worker_result_envelope(
                 worker, f"worker session-{worker['sid']} (agent {agent})",
                 message["body"], provider_id)

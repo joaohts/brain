@@ -20,10 +20,11 @@ something gets answered.
 - Worker results (messages from Claude sessions the brain spawned) become
   rows addressed to the ORIGIN thread at tier "agent", and their reply is
   delivered to the origin channel. A worker whose result was marked final
-  goes idle once that result is delivered: it stays reachable for follow-ups
-  for [claude_sessions] idle_minutes, then is reaped (idle_minutes = 0 reaps
-  at once). Sending it a follow-up wakes it before the send and cancels the
-  deadline until it answers with a new [FINAL], which re-arms the period.
+  goes idle once that result is delivered and stays reachable for
+  follow-ups. Any worker, idle or not, is reaped once it has been inactive
+  (no report, follow-up or pane output) for [claude_sessions] idle_minutes;
+  idle_minutes = 0 reaps at [FINAL]. Sending it a follow-up wakes it before
+  the send.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ MERGE_MAX_MSGS = 20
 MERGE_MAX_CHARS = 4000
 MAX_DRAFT_DISCARDS = 3
 FINAL_MARK = "[FINAL]"
+DEFAULT_IDLE_MINUTES = 480   # [claude_sessions] idle_minutes when unset or 0
+REAP_EVERY = 60.0            # seconds between inactivity sweeps
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS inbox (
@@ -80,7 +83,8 @@ CREATE TABLE IF NOT EXISTS workers (
   state TEXT NOT NULL,
   created_at REAL NOT NULL,
   idle_until REAL,
-  pending INTEGER NOT NULL DEFAULT 0
+  pending INTEGER NOT NULL DEFAULT 0,
+  last_active REAL
 );
 CREATE INDEX IF NOT EXISTS workers_recipient ON workers(recipient);
 """
@@ -120,6 +124,9 @@ class Store:
                                   "INTEGER NOT NULL DEFAULT 0")
                 self.conn.execute("UPDATE workers SET pending=1 WHERE "
                                   "state IN ('starting','running')")
+            if "last_active" not in cols:
+                # unknown until observed; the reaper reads the pane first
+                self.conn.execute("ALTER TABLE workers ADD COLUMN last_active REAL")
 
     def _tx(self):
         store = self
@@ -266,12 +273,13 @@ class Store:
 
     # -- workers (delegations) ---------------------------------------------------
     def add_worker(self, sid, origin_channel, origin_thread, origin_sender, request):
+        now = time.time()
         with self._tx() as c:
             c.execute("INSERT OR REPLACE INTO workers(sid,recipient,origin_channel,"
                       "origin_thread,origin_sender,request,state,created_at,"
-                      "pending) VALUES(?,NULL,?,?,?,?,'starting',?,1)",
+                      "pending,last_active) VALUES(?,NULL,?,?,?,?,'starting',?,1,?)",
                       (sid, origin_channel, origin_thread or "", origin_sender,
-                       request[:500], time.time()))
+                       request[:500], now, now))
 
     def set_worker(self, sid, **fields):
         cols = ", ".join(f"{k}=?" for k in fields)
@@ -286,23 +294,44 @@ class Store:
                 "ORDER BY created_at DESC LIMIT 1", (recipient,)).fetchone()
         return dict(r) if r else None
 
-    def idle_expired(self, now: float) -> list[str]:
+    # Every live worker (starting, running or idle) is reaped once it has been
+    # inactive for [claude_sessions] idle_minutes. `last_active` is the latest
+    # activity seen: its spawn, each report it sent, each follow-up handed to
+    # it, and output in its tmux pane (Brain.reap_idle). It only moves forward.
+    #
+    # `pending` counts the tasks a worker owes a [FINAL] for: its spawn task
+    # plus each follow-up. It is idle only while it owes none, so a [FINAL]
+    # that crossed a newer follow-up can't mark a busy worker idle (or, with
+    # idle_minutes = 0, reap it at once).
+
+    def touch_worker(self, sid: str, at: float | None = None):
+        """Activity seen at `at` (default now)."""
+        at = time.time() if at is None else at
+        with self._tx() as c:
+            c.execute("UPDATE workers SET last_active=MAX(COALESCE(last_active,"
+                      "created_at),?) WHERE sid=? AND state NOT IN "
+                      "('reaped','failed')", (at, sid))
+
+    def live_workers(self) -> list[str]:
         with self.lock:
             return [r["sid"] for r in self.conn.execute(
-                "SELECT sid FROM workers WHERE state='idle' AND idle_until<=?",
-                (now,))]
+                "SELECT sid FROM workers WHERE state NOT IN ('reaped','failed')")]
 
-    # A worker's `pending` counts the tasks it owes a [FINAL] for: its spawn
-    # task plus each follow-up handed to it. It is idle (and reapable) only
-    # while it owes none, so a [FINAL] that crossed a newer follow-up can't
-    # park a worker that is busy with that follow-up.
+    def inactive(self, cutoff: float) -> list[str]:
+        """Live workers with no activity after `cutoff`."""
+        with self.lock:
+            return [r["sid"] for r in self.conn.execute(
+                "SELECT sid FROM workers WHERE state NOT IN ('reaped','failed') "
+                "AND COALESCE(last_active,created_at)<=?", (cutoff,))]
 
     def take_followup(self, target: str) -> tuple[str, dict] | None:
         """A message is about to go to comms `target`. If that is a live
-        worker, wake it before the send: it leaves idle (no deadline) and owes
-        one more [FINAL]. Returns (sid, previous fields) or None."""
+        worker, wake it before the send: the follow-up counts as activity,
+        it leaves idle and owes one more [FINAL]. Returns (sid, previous
+        fields) or None."""
         last = target.rsplit(":", 1)[-1]
         sid = last[len("session-"):] if last.startswith("session-") else None
+        now = time.time()
         with self._tx() as c:
             w = c.execute(
                 "SELECT * FROM workers WHERE (recipient=? OR sid=?) AND state "
@@ -311,55 +340,70 @@ class Store:
             if not w:
                 return None
             c.execute("UPDATE workers SET pending=pending+1, idle_until=NULL, "
+                      "last_active=MAX(COALESCE(last_active,created_at),?), "
                       "state=CASE state WHEN 'idle' THEN 'running' ELSE state "
-                      "END WHERE sid=?", (w["sid"],))
-            return w["sid"], {k: w[k] for k in ("state", "idle_until")}
+                      "END WHERE sid=?", (now, w["sid"]))
+            touched = c.execute("SELECT last_active FROM workers WHERE sid=?",
+                                (w["sid"],)).fetchone()["last_active"]
+            prev = {k: w[k] for k in ("state", "idle_until", "last_active")}
+            prev["touched"] = touched
+            return w["sid"], prev
 
     def drop_followup(self, sid: str, prev: dict):
-        """The follow-up was never handed off: undo take_followup."""
+        """The follow-up was never handed off: undo take_followup (its
+        activity too, unless newer activity was seen since)."""
         with self._tx() as c:
             c.execute("UPDATE workers SET pending=MAX(pending-1,0) WHERE sid=?",
                       (sid,))
+            c.execute("UPDATE workers SET last_active=? WHERE sid=? AND "
+                      "last_active=?", (prev.get("last_active"), sid,
+                                        prev.get("touched")))
             if prev["state"] == "idle":
                 c.execute("UPDATE workers SET state='idle', idle_until=? WHERE "
                           "sid=? AND state='running' AND pending=0",
                           (prev["idle_until"], sid))
 
-    def worker_final(self, sid: str, idle_until: float | None) -> str | None:
-        """A [FINAL] reached the origin: settle one owed task. Once none is
-        owed the worker parks until idle_until (None: reaped at once).
+    def worker_final(self, sid: str, reap: bool = False) -> str | None:
+        """A [FINAL] reached the origin: activity, and one owed task settled.
+        Once none is owed the worker is idle (reap: reaped at once).
         Returns the new state, or None while it still has work."""
+        now = time.time()
         with self._tx() as c:
-            c.execute("UPDATE workers SET pending=MAX(pending-1,0) WHERE sid=? "
-                      "AND state NOT IN ('reaped','failed')", (sid,))
+            c.execute("UPDATE workers SET pending=MAX(pending-1,0), last_active="
+                      "MAX(COALESCE(last_active,created_at),?) WHERE sid=? "
+                      "AND state NOT IN ('reaped','failed')", (now, sid))
             w = c.execute("SELECT state, pending FROM workers WHERE sid=?",
                           (sid,)).fetchone()
             if not w or w["state"] in ("reaped", "failed") or w["pending"]:
                 return None
-            state = "idle" if idle_until else "reaped"
-            c.execute("UPDATE workers SET state=?, idle_until=? WHERE sid=?",
-                      (state, idle_until, sid))
+            state = "reaped" if reap else "idle"
+            c.execute("UPDATE workers SET state=?, idle_until=NULL WHERE sid=?",
+                      (state, sid))
             return state
 
     def worker_progress(self, sid: str):
-        """A progress report: the worker is working, whatever we knew."""
+        """A progress report: activity, and the worker is working, whatever
+        we knew."""
+        self.touch_worker(sid)
         with self._tx() as c:
             c.execute("UPDATE workers SET state='running', idle_until=NULL, "
                       "pending=MAX(pending,1) WHERE sid=? AND state='idle'",
                       (sid,))
 
-    def claim_reap(self, sid: str, now: float | None = None) -> bool:
-        """Mark the worker reaped; with `now`, only if it is still idle past
-        its deadline (a follow-up may have woken it since it was listed)."""
+    def claim_reap(self, sid: str, cutoff: float | None = None) -> bool:
+        """Mark the worker reaped; with `cutoff`, only if it is still live and
+        inactive since then (a follow-up or report may have landed since it
+        was listed)."""
         with self._tx() as c:
-            if now is None:
+            if cutoff is None:
                 cur = c.execute("UPDATE workers SET state='reaped', idle_until="
                                 "NULL, pending=0 WHERE sid=? AND state<>'reaped'",
                                 (sid,))
             else:
                 cur = c.execute("UPDATE workers SET state='reaped', idle_until="
-                                "NULL, pending=0 WHERE sid=? AND state='idle' "
-                                "AND idle_until<=?", (sid, now))
+                                "NULL, pending=0 WHERE sid=? AND state NOT IN "
+                                "('reaped','failed') AND COALESCE(last_active,"
+                                "created_at)<=?", (sid, cutoff))
             return cur.rowcount == 1
 
     def worker(self, sid: str) -> dict | None:
@@ -448,10 +492,17 @@ class Brain:
         self.store.recover(self.prefix)
         if self._ticker is None:
             def loop():
+                next_reap = 0.0
                 while not self._stop.wait(tick):
                     if self.store.has_unread(self.routes):
                         self.kick()
-                    self.reap_idle()
+                    if time.monotonic() >= next_reap:
+                        next_reap = time.monotonic() + REAP_EVERY
+                        try:
+                            self.reap_idle()
+                        except Exception as e:
+                            self.db.step("", "reap_error",
+                                         error=f"{type(e).__name__}: {e}")
             self._ticker = threading.Thread(target=loop, daemon=True,
                                             name="inbox-ticker")
             self._ticker.start()
@@ -611,9 +662,10 @@ class Brain:
                              route=row["route"], error=f"{type(e).__name__}: {e}")
         # a final worker result was handed to its origin (directly, or merged
         # into the origin's own turn whose reply carries it): once the worker
-        # owes no other [FINAL] it goes idle, reachable for follow-ups until
-        # idle_minutes pass. Handing it a follow-up (tools.deliver) wakes it
-        # before the send; so does a progress report.
+        # owes no other [FINAL] it goes idle and stays reachable for
+        # follow-ups until it has been inactive for idle_minutes. Handing it
+        # a follow-up (tools.deliver) wakes it before the send; so does a
+        # progress report. Every report counts as activity.
         if row["kind"] == "worker_result" and not error:
             if meta.get("final") and (delivered or row["merged"]):
                 self.park(meta.get("worker_sid"), turn_id)
@@ -621,19 +673,24 @@ class Brain:
                 self.wake(meta.get("worker_sid"))
 
     def idle_seconds(self) -> float:
-        return 60 * float(self.cfg.get("claude_sessions", {})
-                          .get("idle_minutes", 0) or 0)
+        """How long a worker may stay inactive before it is reaped. 0 (reap
+        at [FINAL]) still leaves the default for workers that never send one."""
+        minutes = float(self.cfg.get("claude_sessions", {})
+                        .get("idle_minutes", 0) or 0)
+        return 60 * (minutes if minutes > 0 else DEFAULT_IDLE_MINUTES)
+
+    def reap_at_final(self) -> bool:
+        return not float(self.cfg.get("claude_sessions", {})
+                         .get("idle_minutes", 0) or 0) > 0
 
     def park(self, sid: str | None, turn_id: str = ""):
         if not sid:
             return
-        idle = self.idle_seconds()
         w = self.store.worker(sid)
-        state = self.store.worker_final(
-            sid, time.time() + idle if idle > 0 else None)
+        state = self.store.worker_final(sid, reap=self.reap_at_final())
         if state == "idle":
             self.db.step(turn_id, "worker_idle", channel=w["origin_channel"],
-                         session=sid, idle_seconds=idle)
+                         session=sid, idle_seconds=self.idle_seconds())
         elif state == "reaped":
             self._killed(w, turn_id)
 
@@ -642,18 +699,40 @@ class Brain:
             self.store.worker_progress(sid)
 
     def reap_idle(self, now: float | None = None):
+        """Reap every session we spawned that has been inactive for
+        idle_minutes, whatever its state. The last pane output of each
+        session (tmux window_activity) counts as activity; looking at it does
+        not. Sessions of ours the table doesn't track as live (spawned before
+        it existed, or a kill that didn't take) are held to the same rule.
+        If the panes can't be read, nothing is reaped."""
+        from . import tools
         now = time.time() if now is None else now
-        for sid in self.store.idle_expired(now):
-            if self.store.claim_reap(sid, now):
-                self._killed(self.store.worker(sid), "")
+        panes = tools.pane_activity(self.cfg)
+        if panes is None:
+            return
+        for sid, at in panes.items():
+            self.store.touch_worker(sid, at)
+        cutoff = now - self.idle_seconds()
+        reaped = set()
+        for sid in self.store.inactive(cutoff):
+            if self.store.claim_reap(sid, cutoff):
+                reaped.add(sid)
+                self._killed(self.store.worker(sid), "", reason="inactive")
+        live = set(self.store.live_workers()) | reaped
+        for sid, at in panes.items():
+            if sid not in live and at <= cutoff:
+                self.db.step("", "worker_reaped", channel="", session=sid,
+                             reason="inactive, untracked")
+                threading.Thread(target=tools.kill_session,
+                                 args=(self.cfg, sid), daemon=True).start()
 
     def reap(self, sid: str | None, turn_id: str = ""):
         if sid and self.store.claim_reap(sid):
             self._killed(self.store.worker(sid), turn_id)
 
-    def _killed(self, w: dict, turn_id: str):
+    def _killed(self, w: dict, turn_id: str, **extra):
         self.db.step(turn_id, "worker_reaped", channel=w["origin_channel"],
-                     session=w["sid"])
-        from .tools import kill_session
-        threading.Thread(target=kill_session, args=(self.cfg, w["sid"]),
+                     session=w["sid"], **extra)
+        from . import tools
+        threading.Thread(target=tools.kill_session, args=(self.cfg, w["sid"]),
                          daemon=True).start()

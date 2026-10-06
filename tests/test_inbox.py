@@ -71,9 +71,14 @@ class Base(unittest.TestCase):
         self.killed = []
         self._kill = tools.kill_session
         tools.kill_session = lambda cfg, sid: self.killed.append(sid) or "killed"
+        # tmux stubbed: {session: last pane output}; None = unreadable
+        self.panes = {}
+        self._panes = tools.pane_activity
+        tools.pane_activity = lambda cfg: self.panes
 
     def tearDown(self):
         tools.kill_session = self._kill
+        tools.pane_activity = self._panes
         self.tmp.cleanup()
 
     def env(self, text_, sender="Owner (cli)", tier="owner", channel="cli", **kw):
@@ -299,20 +304,25 @@ class WorkerTests(Base):
         self.assertEqual((w["merged"], w["reply"]), (1, ""))
         self.assertIdleThenReaped()
 
+    IDLE = 8 * 3600
+
     def assertIdleThenReaped(self, sid="w1"):
-        """A final result parks the worker for idle_minutes; it stays routable
-        and is reaped only once the idle period has passed."""
+        """A final result marks the worker idle; it stays routable and is
+        reaped only once it has been inactive for idle_minutes (8 h)."""
         w = self.brain.store.worker(sid)
         self.assertEqual(w["state"], "idle")
-        self.assertAlmostEqual(w["idle_until"] - time.time(), 15 * 60, delta=30)
+        self.assertAlmostEqual(w["last_active"], time.time(), delta=30)
         self.assertEqual(self.brain.store.worker_by_recipient(w["recipient"])["sid"], sid)
-        self.brain.reap_idle(now=w["idle_until"] - 1)
-        time.sleep(0.05)
-        self.assertEqual(self.killed, [])
-        self.brain.reap_idle(now=w["idle_until"] + 1)
+        self.assertNotReaped(w["last_active"] + self.IDLE - 1)
+        self.brain.reap_idle(now=w["last_active"] + self.IDLE + 1)
         self.wait_reaped()
         self.assertEqual(self.killed, [sid])
         self.assertEqual(self.brain.store.worker(sid)["state"], "reaped")
+
+    def assertNotReaped(self, now):
+        self.brain.reap_idle(now=now)
+        time.sleep(0.05)
+        self.assertEqual(self.killed, [])
 
     def test_idle_minutes_zero_reaps_at_once(self):
         self.cfg["claude_sessions"]["idle_minutes"] = 0
@@ -329,24 +339,24 @@ class WorkerTests(Base):
         self.submit_worker("[FINAL] done", pid="comms:m_x:m1")
         self.client.script = [(text("Done."), None)]
         self.brain.drain()
-        first = self.brain.store.worker("w1")["idle_until"]
+        first = self.brain.store.worker("w1")["last_active"]
         # the worker took a follow-up: its progress report wakes it
+        time.sleep(0.01)
         self.submit_worker("looking into the follow-up", pid="comms:m_x:m2")
         self.client.script = [(text("On it."), None)]
         self.brain.drain()
         w = self.brain.store.worker("w1")
-        self.assertEqual((w["state"], w["idle_until"]), ("running", None))
-        self.brain.reap_idle(now=first + 3600)
-        time.sleep(0.05)
-        self.assertEqual(self.killed, [])
-        # its next final report parks it again with a fresh deadline
+        self.assertEqual(w["state"], "running")
+        self.assertGreater(w["last_active"], first)
+        self.assertNotReaped(first + self.IDLE)
+        # its next final report marks it idle again, with fresh activity
         time.sleep(0.01)
         self.submit_worker("[FINAL] follow-up answered", pid="comms:m_x:m3")
         self.client.script = [(text("Answered."), None)]
         self.brain.drain()
         w = self.brain.store.worker("w1")
         self.assertEqual(w["state"], "idle")
-        self.assertGreater(w["idle_until"], first)
+        self.assertIdleThenReaped()
 
     def test_claude_kill_ends_an_idle_worker_at_once(self):
         self.worker()
@@ -356,7 +366,7 @@ class WorkerTests(Base):
         self.assertEqual(self.killed, ["w1"])
         self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
         self.assertIsNone(self.brain.store.worker_by_recipient("m_x:a_w"))
-        self.brain.reap_idle(now=time.time() + 3600)
+        self.brain.reap_idle(now=time.time() + 24 * 3600)
         time.sleep(0.05)
         self.assertEqual(self.killed, ["w1"])
 
@@ -387,23 +397,24 @@ class WorkerTests(Base):
         self.brain.drain()
 
     def assertBusy(self, sid="w1"):
+        """Running, and not reaped while active (here: within 8 h)."""
         w = self.brain.store.worker(sid)
         self.assertEqual((w["state"], w["idle_until"]), ("running", None))
-        self.brain.reap_idle(now=time.time() + 24 * 3600)
-        time.sleep(0.05)
-        self.assertEqual(self.killed, [])
+        self.assertNotReaped(w["last_active"] + self.IDLE - 1)
 
     def test_follow_up_wakes_the_worker_before_the_send_near_its_deadline(self):
         self.worker()
         self.final()
-        deadline = self.brain.store.worker("w1")["idle_until"]
+        before = self.brain.store.worker("w1")["last_active"]
+        time.sleep(0.01)
         out, sent = self.followup()
         self.assertEqual(sent, [("m_x:a_w", "running")])   # woken before the send
         self.assertIn("worker session-w1 is awake", out)
-        # silent work long past the old deadline: never reaped
+        # the follow-up is activity: the clock restarts from it
+        self.assertGreater(self.brain.store.worker("w1")["last_active"], before)
+        self.assertNotReaped(before + self.IDLE + 0.005)
         self.assertBusy()
-        self.brain.reap_idle(now=deadline + 1)
-        # its next [FINAL] starts a fresh idle period, then it is reaped
+        # its next [FINAL] is activity too, then it is reaped once inactive
         self.final("[FINAL] follow-up answered", pid="comms:m_x:f2")
         self.assertIdleThenReaped()
 
@@ -446,20 +457,22 @@ class WorkerTests(Base):
     def test_failed_follow_up_send_leaves_the_worker_idle(self):
         self.worker()
         self.final()
-        deadline = self.brain.store.worker("w1")["idle_until"]
+        before = self.brain.store.worker("w1")["last_active"]
+        time.sleep(0.01)
         out, _ = self.followup(ok=False)
         self.assertIn("node_unavailable", out)
-        w = self.brain.store.worker("w1")
-        self.assertEqual((w["state"], w["idle_until"], w["pending"]),
-                         ("idle", deadline, 0))
+        w = self.brain.store.worker("w1")   # undone, its activity too
+        self.assertEqual((w["state"], w["last_active"], w["pending"]),
+                         ("idle", before, 0))
 
     def test_reaper_that_listed_a_worker_loses_to_a_follow_up(self):
         self.worker()
         self.final()
-        late = self.brain.store.worker("w1")["idle_until"] + 1
-        self.assertEqual(self.brain.store.idle_expired(late), ["w1"])
+        cutoff = self.brain.store.worker("w1")["last_active"] + 0.001
+        self.assertEqual(self.brain.store.inactive(cutoff), ["w1"])
+        time.sleep(0.01)
         self.followup()
-        self.assertFalse(self.brain.store.claim_reap("w1", late))
+        self.assertFalse(self.brain.store.claim_reap("w1", cutoff))
         self.assertBusy()
 
     def test_follow_up_to_a_reaped_worker_is_just_sent(self):
@@ -477,6 +490,100 @@ class WorkerTests(Base):
         self.final()   # a late [FINAL] doesn't resurrect it
         self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
 
+    # -- inactivity timeout --------------------------------------------------
+
+    def test_worker_that_never_sends_final_is_reaped_once_inactive(self):
+        w = self.worker()
+        self.assertEqual(w["state"], "running")
+        self.assertNotReaped(w["created_at"] + self.IDLE - 1)
+        self.brain.reap_idle(now=w["created_at"] + self.IDLE + 1)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["w1"])
+        self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
+        self.assertEqual(len(self.steps("worker_reaped")), 1)
+
+    def test_pane_output_keeps_a_long_task_alive(self):
+        """Not an execution limit: a worker printing output 10 h after its
+        spawn (no report, no [FINAL]) lives on; 8 h after its last output
+        it is reaped."""
+        w = self.worker()
+        t0 = w["created_at"]
+        self.panes = {"w1": t0 + 10 * 3600}
+        self.assertNotReaped(t0 + 10 * 3600 + self.IDLE - 1)
+        self.assertEqual(self.brain.store.worker("w1")["last_active"],
+                         t0 + 10 * 3600)
+        self.brain.reap_idle(now=t0 + 10 * 3600 + self.IDLE + 1)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["w1"])
+
+    def test_pane_output_renews_an_idle_worker(self):
+        self.worker()
+        self.final()
+        t = self.brain.store.worker("w1")["last_active"]
+        self.panes = {"w1": t + 3600}
+        self.assertNotReaped(t + self.IDLE + 1)
+        self.assertEqual(self.brain.store.worker("w1")["state"], "idle")
+
+    def test_a_report_counts_as_activity_on_arrival(self):
+        w = self.worker()
+        self.brain.store.set_worker("w1", last_active=w["created_at"] - 3600)
+        from brain import comms_v1
+        ad = comms_v1.BrainComms.__new__(comms_v1.BrainComms)
+        ad.brain, ad.trusted = self.brain, set()
+        ad._envelope({"message_json": json.dumps({"body": "still going"}),
+                      "sender_machine_id": "m_x", "sender_agent_id": "a_w",
+                      "message_id": "m9"})
+        self.assertAlmostEqual(self.brain.store.worker("w1")["last_active"],
+                               time.time(), delta=5)
+
+    def test_unreadable_panes_reap_nothing(self):
+        w = self.worker()
+        self.panes = None
+        self.assertNotReaped(w["created_at"] + 10 * self.IDLE)
+        self.assertEqual(self.brain.store.worker("w1")["state"], "running")
+
+    def test_untracked_sessions_of_ours_are_held_to_the_same_rule(self):
+        now = time.time()
+        self.worker("w1")
+        self.brain.store.set_worker("w1", state="failed")   # e.g. spawn failed
+        self.panes = {"old": now - self.IDLE - 60, "fresh": now - 60,
+                      "w1": now - self.IDLE - 1}
+        self.brain.reap_idle(now=now)
+        for _ in range(50):
+            if len(self.killed) == 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(sorted(self.killed), ["old", "w1"])
+
+    def test_a_worker_is_killed_once_per_sweep(self):
+        w = self.worker()
+        self.panes = {"w1": w["created_at"]}
+        self.brain.reap_idle(now=w["created_at"] + self.IDLE + 1)
+        time.sleep(0.1)
+        self.assertEqual(self.killed, ["w1"])
+
+    def test_idle_minutes_zero_still_times_out_unfinished_workers(self):
+        self.cfg["claude_sessions"]["idle_minutes"] = 0
+        w = self.worker()
+        self.assertNotReaped(w["created_at"] + self.IDLE - 1)
+        self.brain.reap_idle(now=w["created_at"] + self.IDLE + 1)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["w1"])
+
+    def test_pane_activity_reads_only_our_sessions(self):
+        from unittest import mock
+        out = "joana-1a\t100\njoana-1a\t250\nmcp-9\t300\njoanax\t5\n"
+        self.cfg["claude_sessions"]["source"] = "joana"
+        with mock.patch.object(tools.subprocess, "run", return_value=NS(
+                returncode=0, stdout=out, stderr="")):
+            self.assertEqual(self._panes(self.cfg), {"joana-1a": 250.0})
+        with mock.patch.object(tools.subprocess, "run", return_value=NS(
+                returncode=1, stdout="", stderr="no server running on /tmp/x")):
+            self.assertEqual(self._panes(self.cfg), {})
+        with mock.patch.object(tools.subprocess, "run", return_value=NS(
+                returncode=1, stdout="", stderr="permission denied")):
+            self.assertIsNone(self._panes(self.cfg))
+
     def test_old_workers_table_is_migrated(self):
         import sqlite3
         path = os.path.join(self.tmp.name, "old.db")
@@ -490,8 +597,13 @@ class WorkerTests(Base):
         store = inbox.Store(path)
         self.assertIsNone(store.worker("old")["idle_until"])
         self.assertEqual(store.worker("old")["pending"], 1)   # owes its [FINAL]
-        store.set_worker("old", state="idle", idle_until=1.0)
-        self.assertEqual(store.idle_expired(2.0), ["old"])
+        self.assertIsNone(store.worker("old")["last_active"])
+        # unobserved activity counts from its spawn; observed, it moves on
+        self.assertEqual(store.inactive(1.0), ["old"])
+        store.touch_worker("old", 5.0)
+        self.assertEqual(store.inactive(1.0), [])
+        store.touch_worker("old", 3.0)          # never backwards
+        self.assertEqual(store.worker("old")["last_active"], 5.0)
 
     def test_worker_result_waits_for_another_senders_turn_then_handed_off(self):
         self.worker(origin="cli")
@@ -560,12 +672,13 @@ class SpawnTests(Base):
                          ("brain-1a2b", "wpp:owner", "running"))
         self.assertIn(inbox.FINAL_MARK, self.posted[0][1])
         self.assertIn("do NOT close comms or /exit", self.posted[0][1])
-        self.assertIn("about 15 minutes", self.posted[0][1])
+        self.assertIn("inactive for 8 hours", self.posted[0][1])
 
     def test_spawn_with_no_idle_keeps_exit_instruction(self):
         self.cfg["claude_sessions"]["idle_minutes"] = 0
         self.spawn()
         self.assertIn("end this session with /exit", self.posted[0][1])
+        self.assertIn("inactive for 8 hours is closed", self.posted[0][1])
 
     def test_spawn_failure_lands_in_the_origin_thread(self):
         def boom(cfg, cwd):

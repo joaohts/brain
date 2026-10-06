@@ -226,18 +226,48 @@ def kill_session(cfg, sid: str) -> str:
     return r.stdout.strip() or r.stderr.strip() or f"killed {sid}"
 
 
+def pane_activity(cfg) -> dict[str, float] | None:
+    """{session id: time of its pane's last output} for every tmux session
+    named after our [claude_sessions] source, or None if tmux can't be read.
+    Reading it is not activity: tmux updates window_activity only on output."""
+    prefix = f"{cfg['claude_sessions'].get('source') or 'brain'}-"
+    try:
+        r = subprocess.run(["tmux", "list-windows", "-a", "-F",
+                            "#{session_name}\t#{window_activity}"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        if "no server running" in r.stderr or "error connecting" in r.stderr:
+            return {}
+        return None
+    seen: dict[str, float] = {}
+    for line in r.stdout.splitlines():
+        name, _, at = line.partition("\t")
+        if name.startswith(prefix) and at.isdigit():
+            seen[name] = max(seen.get(name, 0.0), float(at))
+    return seen
+
+
+def _idle_text(minutes: float) -> str:
+    return (f"{minutes / 60:g} hours" if minutes >= 120 and minutes % 60 == 0
+            else f"{minutes:g} minutes")
+
+
 def _after_final(cfg) -> str:
     """Worker instructions for after its [FINAL] report."""
+    from .inbox import DEFAULT_IDLE_MINUTES
     idle = cfg["claude_sessions"].get("idle_minutes", 0) or 0
     if idle <= 0:
         return ("After the final report is sent (and any handoffs "
                 "acknowledged), close comms and end this session with /exit — "
-                "finished workers are reaped.")
+                "finished workers are reaped. A session inactive for "
+                f"{_idle_text(DEFAULT_IDLE_MINUTES)} is closed for you.")
     return (f"After the final report, do NOT close comms or /exit: stay idle "
-            f"and keep your context, since follow-ups may arrive over comms "
-            f"for about {idle:g} minutes. Answer a follow-up like the original "
-            f"task (start its last report with {_final_mark()} again). The "
-            f"session is closed for you once it stays idle that long.")
+            f"and keep your context, since follow-ups may arrive over comms. "
+            f"Answer a follow-up like the original task (start its last "
+            f"report with {_final_mark()} again). The session is closed for "
+            f"you once it has been inactive for {_idle_text(idle)}.")
 
 
 def _final_mark() -> str:
