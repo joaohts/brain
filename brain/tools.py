@@ -742,6 +742,63 @@ def t_whatsapp_pair(env, args, cfg, db):
             f"codes sent). Ask again to retry.")
 
 
+# -- vault (brain/vault.py) ------------------------------------------------------
+# Owner only: ring 2 keeps the tools out of family/unknown schemas, they are not
+# flagged agent=True, and each call re-checks the tier anyway.
+
+def _vault_call(env, db, name, fn, *a, write=False, **kw):
+    from . import vault
+    if env.get("tier") != "owner":
+        db.step(env.get("turn_id", ""), "policy_denial", channel=env["channel"],
+                tool=name, sender=env["sender"])
+        return "denied by policy: the vault is owner-only"
+    try:
+        out = fn(*a, **kw)
+    except vault.VaultError as e:
+        out = f"refused: {e}"
+    except OSError as e:
+        out = f"failed: {e.strerror or e}"
+    if write:
+        db.step(env.get("turn_id", ""), "vault_write", channel=env["channel"],
+                tool=name, path=str(kw.get("path", a[1] if len(a) > 1 else "")),
+                sender=env["sender"], result=out[:300])
+    return out
+
+
+def t_vault_list(env, args, cfg, db):
+    from . import vault
+    return _vault_call(env, db, "vault_list", vault.list_dir, cfg["vault"],
+                       str(args.get("path") or ""), bool(args.get("recursive")))
+
+
+def t_vault_search(env, args, cfg, db):
+    from . import vault
+    return _vault_call(env, db, "vault_search", vault.search, cfg["vault"],
+                       args.get("query"), str(args.get("path") or ""),
+                       args.get("max_results"))
+
+
+def t_vault_read(env, args, cfg, db):
+    from . import vault
+    return _vault_call(env, db, "vault_read", vault.read_note, cfg["vault"],
+                       args.get("path", ""), args.get("offset") or 1,
+                       args.get("limit"))
+
+
+def t_vault_create(env, args, cfg, db):
+    from . import vault
+    return _vault_call(env, db, "vault_create", vault.create_note, cfg["vault"],
+                       args.get("path", ""), args.get("content", ""), write=True)
+
+
+def t_vault_edit(env, args, cfg, db):
+    from . import vault
+    return _vault_call(env, db, "vault_edit", vault.edit_note, cfg["vault"],
+                       args.get("path", ""), args.get("mode", ""),
+                       args.get("content", ""), args.get("old_text", ""),
+                       args.get("base_sha256", ""), write=True)
+
+
 TOOLS = [
     dict(name="remember", ring=2, fn=t_remember,
          description="Saves a lasting fact to durable memory, attributed to "
@@ -871,6 +928,54 @@ TOOLS = [
          parameters={"type": "object", "properties": {
              "cancel": {"type": "boolean"}},
              "required": []}),
+    dict(name="vault_list", ring=2, fn=t_vault_list, requires="vault",
+         description="Lists folders and .md notes in {owner}'s notes vault. "
+                      "Paths are relative to the vault root ('' = root).",
+         parameters={"type": "object", "properties": {
+             "path": {"type": "string", "description": "folder; omit for root"},
+             "recursive": {"type": "boolean"}}, "required": []}),
+    dict(name="vault_search", ring=2, fn=t_vault_search, requires="vault",
+         description="Case-insensitive text search over note names and "
+                      "contents in {owner}'s vault. Returns note paths with "
+                      "matching line numbers; open one with vault_read.",
+         parameters={"type": "object", "properties": {
+             "query": {"type": "string"},
+             "path": {"type": "string", "description": "limit to a folder"},
+             "max_results": {"type": "integer"}}, "required": ["query"]}),
+    dict(name="vault_read", ring=2, fn=t_vault_read, requires="vault",
+         description="Reads a note from {owner}'s vault. The header gives its "
+                      "sha256 (needed by vault_edit overwrite) and, for long "
+                      "notes, the offset to continue from.",
+         parameters={"type": "object", "properties": {
+             "path": {"type": "string", "description": "e.g. projects/x.md"},
+             "offset": {"type": "integer", "description": "first line, 1-based"},
+             "limit": {"type": "integer", "description": "number of lines"}},
+             "required": ["path"]}),
+    dict(name="vault_create", ring=2, fn=t_vault_create, requires="vault",
+         description="Creates a new .md note in {owner}'s vault (missing "
+                      "folders are created). Fails if the note exists; edit "
+                      "it with vault_edit instead.",
+         parameters={"type": "object", "properties": {
+             "path": {"type": "string"}, "content": {"type": "string"}},
+             "required": ["path", "content"]}),
+    dict(name="vault_edit", ring=2, fn=t_vault_edit, requires="vault",
+         description="Edits an existing note in {owner}'s vault. mode append "
+                      "adds content at the end; replace swaps old_text (must "
+                      "match exactly once) for content; overwrite replaces "
+                      "the whole note and needs base_sha256 from vault_read. "
+                      "If the note changed in the meantime the edit is "
+                      "refused: read it again and redo it. Keep the note's "
+                      "language and [[wikilinks]].",
+         parameters={"type": "object", "properties": {
+             "path": {"type": "string"},
+             "mode": {"type": "string",
+                      "enum": ["append", "replace", "overwrite"]},
+             "content": {"type": "string"},
+             "old_text": {"type": "string", "description": "for replace"},
+             "base_sha256": {"type": "string",
+                             "description": "from vault_read; required for "
+                                            "overwrite, optional otherwise"}},
+             "required": ["path", "mode", "content"]}),
 ]
 
 

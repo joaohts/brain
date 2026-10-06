@@ -67,3 +67,15 @@ source = "brain"                    # session-name prefix
 idle_minutes = 480                  # a worker inactive this long (no pane output, report
                                     # or follow-up) is killed, [FINAL] or not; 0 = kill
                                     # at [FINAL] (480 still applies to the rest)
+
+[vault]                             # vault_* tools: owner-only notes folder access
+enabled = false
+path = ""                           # e.g. "~/notes"; the tools never run git
+read_only = []                      # folder prefixes readable but never written
+deny = []                           # vault-relative globs never read or written,
+                                    # e.g. ["private/secrets.md", "**/secrets.md"]
+max_note_bytes = 1000000            # larger notes are refused
+max_read_chars = 20000              # per vault_read call; page with offset
+max_write_bytes = 200000            # largest note a write may produce
+max_results = 50                    # list entries / search hits per call
+search_seconds = 5

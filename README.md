@@ -160,7 +160,7 @@ clear message.
 | `[limits]` | `max_tool_steps`, `window_turns`, `auto_compact_turns`, `blackboard_hours`, `blackboard_max_lines` | 6, 20, 40, 4, 12 | context and loop limits |
 | `[messages]` | `budget_reached`, `out_of_steps`, `failure` | English | fixed replies sent without a model call; write them in your language (`{owner}`, `{request}`) |
 | `[server]` | `host` / `port` | `127.0.0.1` / `3401` | the `/turn` API (no auth: keep it on localhost) |
-| `[whatsapp]` `[comms]` `[calendar]` `[claude_sessions]` | `enabled` … | off | see Integrations |
+| `[whatsapp]` `[comms]` `[calendar]` `[claude_sessions]` `[vault]` | `enabled` … | off | see Integrations |
 
 `BRAIN_CONFIG=/path/to/other.toml` points the brain at a different config file,
 which is handy for a test instance.
@@ -268,6 +268,32 @@ of promising a follow-up.
 it is killed, whether or not it sent a `[FINAL]`. `0` kills a worker as soon
 as its `[FINAL]` reaches the origin; workers that never send one still time
 out after the default 480.
+
+### Vault (`[vault]`)
+
+Owner-only tools over a folder of Markdown notes, such as an Obsidian vault:
+`vault_list`, `vault_search` (case-insensitive, names and contents),
+`vault_read` (paged, returns the note's sha256), `vault_create` (new notes
+only) and `vault_edit` (`append`; `replace` of text that matches exactly
+once; `overwrite`, which needs the sha256 from `vault_read`). There is no
+delete or rename. The tools are ring 2 and not agent tools, so family,
+unknown and worker turns never see them, and each call re-checks the tier.
+Owner turns include agents on `[comms] trusted_machines`.
+
+- **Confinement**: paths are relative to `path` and walked one folder at a
+  time with `O_NOFOLLOW`, so `..`, absolute paths and symlinks can't leave
+  the vault, even if a folder is swapped for a link mid-call. Reads follow a
+  link only when its real target is inside the vault; writes never go
+  through one. Hidden entries (`.git`, `.obsidian`) are invisible, only
+  `.md` files are touched, `read_only` folders can be read but not written,
+  and `deny` globs can't be read at all.
+- **Writes** go to a temp file in the same folder, are fsynced and renamed
+  into place. Right before the rename the note is compared with what the
+  edit was based on; if anything else changed it (a git pull, Obsidian), the
+  edit is refused and the model is told to read it again. Every write is
+  traced as a `vault_write` step.
+- **Sync** is not the brain's job: the tools never run git. If the vault is
+  a git checkout, whatever syncs it must cope with local edits.
 
 ### Calendar (`[calendar]`)
 

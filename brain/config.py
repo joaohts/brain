@@ -3,7 +3,8 @@
 
 load() returns one flat dict: the [agent], [model], [limits] and [server]
 keys at top level, and each integration as a nested dict
-(cfg["whatsapp"], cfg["comms"], cfg["calendar"], cfg["claude_sessions"]).
+(cfg["whatsapp"], cfg["comms"], cfg["calendar"], cfg["claude_sessions"],
+cfg["vault"]).
 Relative paths resolve against the repo root. An enabled integration with a
 broken setting raises ConfigError at startup rather than failing mid-turn.
 
@@ -77,6 +78,17 @@ INTEGRATIONS = {
         "source": "brain",
         "idle_minutes": 480,    # reap a worker after this long inactive; 0 = reap at [FINAL]
     },
+    "vault": {
+        "enabled": False,
+        "path": "",                 # notes folder (e.g. an Obsidian vault)
+        "read_only": [],            # folder prefixes readable but never written
+        "deny": [],                 # globs (vault-relative) never read or written
+        "max_note_bytes": 1_000_000,   # larger notes are refused
+        "max_read_chars": 20_000,      # per vault_read call; page with offset
+        "max_write_bytes": 200_000,    # largest note a write may produce
+        "max_results": 50,             # list entries / search hits per call
+        "search_seconds": 5,
+    },
 }
 
 # Fixed replies sent without a model call. Write them in [agent] language.
@@ -92,7 +104,8 @@ PATH_KEYS = ("identity_file", "memory_dir", "db_path")
 INTEGRATION_PATHS = {"whatsapp": ("contacts_file", "auth_dir"),
                      "comms": ("socket", "state_path"),
                      "calendar": ("script",),
-                     "claude_sessions": ("script",)}
+                     "claude_sessions": ("script",),
+                     "vault": ("path",)}
 
 
 class ConfigError(Exception):
@@ -183,6 +196,17 @@ def validate(cfg) -> None:
     if enabled(cfg, "claude_sessions") and not enabled(cfg, "comms"):
         raise ConfigError("claude_sessions needs [comms] enabled: workers "
                           "receive tasks and report back over comms")
+    if enabled(cfg, "vault"):
+        v = cfg["vault"]
+        if not v["path"] or not os.path.isdir(v["path"]):
+            raise ConfigError(f"vault: path is not a folder: {v['path']!r}")
+        for k in ("max_note_bytes", "max_read_chars", "max_write_bytes",
+                  "max_results", "search_seconds"):
+            if not isinstance(v[k], (int, float)) or v[k] <= 0:
+                raise ConfigError(f"vault: {k} must be a positive number")
+        for k in ("read_only", "deny"):
+            if not isinstance(v[k], list) or not all(isinstance(x, str) for x in v[k]):
+                raise ConfigError(f"vault: {k} must be a list of strings")
     for name in ("calendar", "claude_sessions"):
         if enabled(cfg, name):
             s = cfg[name]["script"]
