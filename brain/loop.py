@@ -5,7 +5,6 @@ coherent blackboard. Every step traced to SQLite. Turns are started by the
 inbox dispatcher (brain/inbox.py); before each model step the running turn
 merges new messages from the same sender and thread."""
 
-import glob
 import json
 import os
 import threading
@@ -15,24 +14,9 @@ import uuid
 from openai import OpenAI
 
 from . import prompts, tools
-from .config import api_key, enabled
+from .config import api_key, enabled, message
 from .db import DB
 from .inbox import MAX_DRAFT_DISCARDS
-
-def _identity(cfg) -> str:
-    try:
-        return open(cfg["identity_file"]).read()
-    except FileNotFoundError:
-        return (f"You are {cfg['assistant_name']}, personal assistant to "
-                f"{cfg['owner_name']}. Reply in {cfg['language']}, briefly.")
-
-
-def _memory(cfg) -> str:
-    parts = []
-    for p in sorted(glob.glob(os.path.join(cfg["memory_dir"], "*.md"))):
-        parts.append(open(p).read())
-    return "\n".join(parts)[-4000:]  # v1: load-all, tail-capped; retrieval later
-
 
 def reasoning_tokens(usage) -> int:
     """Reasoning tokens are a subset of output_tokens (already in _cost)."""
@@ -65,7 +49,7 @@ def _merge(rows, env, db, turns_input):
     for r in rows:
         text = stamp(r)
         turns_input.append({"role": "user", "content": text})
-        db.add_message(env["channel"], "user", r["sender"], r["text"])
+        db.add_message(env["channel"], "user", r["sender"], r["text"], r["tier"])
         db.step(env["turn_id"], "merged", channel=env["channel"],
                 inbox_id=r["id"], sender=r["sender"], tier=r["tier"],
                 kind=r["kind"])
@@ -81,75 +65,35 @@ def _run(env, cfg, db, client, pull=None, renew=None, turn_id=None):
             sender=env["sender"], tier=env["tier"], text=env["text"])
 
     if cfg["daily_budget_usd"] and db.spend_today() > cfg["daily_budget_usd"]:
-        return (f"Daily budget reached — ask {cfg['owner_name']} to raise "
-                f"daily_budget_usd.")
+        return message(cfg, "budget_reached")
 
-    db.add_message(env["channel"], "user", env["sender"], env["text"])
+    db.add_message(env["channel"], "user", env["sender"], env["text"],
+                   env["tier"])
 
     board = db.blackboard(env["channel"], cfg["blackboard_hours"],
                           cfg["blackboard_max_lines"])
     window = db.window(env["channel"], cfg["window_turns"])
-    system = _identity(cfg)
-    memory = _memory(cfg)
-    if memory:
-        system += f"\n\n## Durable memory\n{memory}"
-    summary = db.get_summary(env["channel"])
-    if summary:
-        system += f"\n\n## This channel, earlier (summary)\n{summary}"
-    if board:
-        system += ("\n\n## Other channels (right now)\n"
-                   "These are YOUR other ongoing conversations — one "
-                   "mind, the channels are mouths; whoever speaks there is "
-                   "also you. Use read_thread to see more of any of them.\n"
-                   + "\n".join(board))
+    ident = None
     if enabled(cfg, "comms"):
         from . import comms_v1
-        ident = comms_v1.identity()
-        system += "\n\n" + prompts.comms_guide(
-            cfg, ident["result"] if ident["ok"] else None)
-    pending_cal = tools.calendar_pending(env["channel"])
-    if pending_cal:
-        system += ("\n\n## Pending calendar change (staged, NOT executed)\n"
-                   f"{pending_cal}\n"
-                   "If the person's latest message confirms it, call "
-                   "calendar_confirm; if they decline, call calendar_confirm "
-                   "with cancel=true. Do not stage it again.")
-    book = tools.contacts(cfg)
-    if book:
-        roster = " | ".join(f"{v['name']}: wpp:{a}" for a, v in book.items())
-        system += f"\n\n## Contacts (send_to channels)\n{roster}"
+        r = comms_v1.identity()
+        ident = r["result"] if r["ok"] else None
+    meta = env.get("meta") or {}
+    worker = None
+    if env.get("kind") in ("worker_result", "system"):
+        worker = {"kind": ("final report" if meta.get("final") else "progress report")
+                  if env["kind"] == "worker_result" else "runtime notice",
+                  "sid": meta.get("worker_sid") or "?",
+                  "origin": env.get("origin") or env["channel"],
+                  "request": (meta.get("request") or "")[:200]}
     # Past tool calls belong in the system record, never as assistant turns:
     # shown as assistant content, the model imitates the trace format and
-    # NARRATES fake tool calls (with invented results) instead of emitting
-    # real ones. This block is reference only.
-    traces = [m["text"] for m in window[:-1] if m["role"] == "tool"]
-    if traces:
-        system += ("\n\n## Actions you already took (system record — NOT text "
-                   "you write, and NOT proof of anything for the current "
-                   "request; to actually do something you MUST emit a real "
-                   "tool call this turn)\n" + "\n".join(traces[-8:]))
-    now = time.strftime("%A %d/%m/%Y %H:%M")
-    system += (f"\n\n## This turn\nNow: {now}. Channel: {env['channel']} | "
-               f"Speaker: {env['sender']} (tier {env['tier']})."
-               + (" Your reply will be SPOKEN aloud: 1-3 plain spoken "
-                  "sentences." if env["channel"].startswith("voice") else "")
-               + (" Format with WhatsApp marks exclusively: *bold*, "
-                  "_italic_, ~strike~, ```mono```; lists as plain lines. "
-                  "This channel renders markdown literally."
-                  if env["channel"].startswith("wpp:") else "")
-               + (" Agent-to-agent turn: the sender is a work session, not a "
-                  "person. Step 1, always: content addressed to a channel "
-                  "(results, reports, updates 'for wpp:...') is delivered "
-                  "there with send_to — this comes before everything. "
-                  "Step 2: reply here with instructions or questions when "
-                  "you have them; NO_REPLY is valid only once step 1 is "
-                  "done. Finished workers are reaped automatically. "
-                  "NACKs and delivery "
-                  "errors are INTERNAL signals: never announce, speak, or "
-                  "relay them on any human channel — act on "
-                  "them (start the task properly with claude_spawn, or tell "
-                  f"{cfg['owner_name']} plainly that something failed)."
-                  if env["channel"].startswith(("comms:", "comms-v1:")) else ""))
+    # narrates fake tool calls instead of emitting real ones.
+    traces = [m["text"] for m in window[:-1] if m["role"] == "tool"][-8:]
+    system, stats = prompts.compose(
+        env, cfg, db, board=board, book=tools.contacts(cfg), traces=traces,
+        pending_cal=tools.calendar_pending(env["channel"]),
+        comms_identity=ident, worker=worker)
 
     turns_input = []
     for m in window[:-1]:
@@ -163,7 +107,7 @@ def _run(env, cfg, db, client, pull=None, renew=None, turn_id=None):
 
     db.step(turn_id, "context", channel=env["channel"],
             window=len(window), blackboard=len(board),
-            memory_chars=len(memory), system_chars=len(system))
+            memory_chars=stats["memory_chars"], system_chars=len(system))
 
     schema = tools.schema_for(env["tier"], cfg)
     final = ""
@@ -219,7 +163,9 @@ def _run(env, cfg, db, client, pull=None, renew=None, turn_id=None):
         _merge(pull(), env, db, turns_input)   # step boundary
 
     if not final.strip():
-        final = "Something went wrong on my side just now — could you say that again?"
+        request = " ".join(env["text"].split())[:160]
+        final = message(cfg, "out_of_steps" if steps >= budget else "failure",
+                        request=request)
     db.add_message(env["channel"], "assistant", cfg["assistant_name"], final)
     db.step(turn_id, "reply", channel=env["channel"],
             ms=int((time.time() - t0) * 1000), text=final)

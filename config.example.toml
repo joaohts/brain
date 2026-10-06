@@ -30,6 +30,12 @@ blackboard_max_lines = 12
 host = "127.0.0.1"                  # keep it on localhost: /turn has no auth
 port = 3401
 
+[messages]                          # fixed replies sent without a model call;
+                                    # write them in [agent] language
+budget_reached = "I've reached today's spending limit, so I can't answer until tomorrow. {owner} can raise daily_budget_usd."
+out_of_steps = "I ran out of steps before finishing this: {request}"
+failure = "Something failed on my side before I could answer: {request}"
+
 # ---- optional integrations: all off by default -----------------------------
 
 [whatsapp]                          # wa/ sidecar (Baileys), service brain-wa

@@ -265,7 +265,9 @@ class WorkerTests(Base):
         row = self.submit_worker("[FINAL] 3 errors found")
         self.client.script = [(text("The logs show 3 errors."), None)]
         self.brain.drain()
-        self.assertIn("Result of a task delegated for cli", self.client.inputs(0))
+        self.assertIn("[worker report, final, session w1]", self.client.inputs(0))
+        self.assertIn("task delegated for cli", self.client.calls[0]["instructions"])
+        self.assertIn("reply goes to the requester on cli", self.client.calls[0]["instructions"])
         self.assertEqual(self.client.tool_names(0), {"send_to"})    # agent tier
         r = self.brain.store.get(row)
         self.assertEqual((r["channel"], r["tier"], r["reply"]),

@@ -25,11 +25,14 @@ from .loop import _cost, reasoning_tokens
 
 PROMPT = """You are the memory-consolidation process of the assistant {assistant}.
 Input: the current summary of channel '{channel}' (may be empty) and old
-messages about to be deleted. Output JSON with exactly these keys:
+messages about to be deleted. Each message line shows its speaker and tier.
+Output JSON with exactly these keys:
 - "summary": updated running summary of the channel, merging the current
-  summary with what the messages add. <=150 words. Facts and open items.
-- "facts": list (may be empty) of DURABLE facts worth permanent memory
-  (preferences, decisions, people, dates). Keep only what stays true.
+  summary with what the messages add. At most 150 words: facts and open items.
+- "facts": list (may be empty) of durable facts worth permanent memory
+  (preferences, decisions, people, dates), each as
+  {{"fact": "...", "speaker": "<speaker as shown>", "tier": "<tier as shown>"}}.
+  Keep only what stays true, and attribute each fact to the message it came from.
 
 ## Current summary
 {old_summary}
@@ -38,13 +41,29 @@ messages about to be deleted. Output JSON with exactly these keys:
 {messages}"""
 
 
+def fact_line(f, channel: str) -> str | None:
+    """One facts.md line. Facts from owner-tier messages are stored plainly;
+    anything else is kept but marked unconfirmed with its speaker."""
+    if isinstance(f, str):      # a model that ignored the schema: unattributed
+        f = {"fact": f, "speaker": "unknown", "tier": ""}
+    text = " ".join(str(f.get("fact", "")).split())
+    if not text:
+        return None
+    day = datetime.date.today()
+    if f.get("tier") == "owner":
+        return f"- {day} [{channel}]: {text}"
+    return (f"- {day} [{channel}] (unconfirmed, said by "
+            f"{f.get('speaker') or 'unknown'}, tier {f.get('tier') or '?'}): {text}")
+
+
 def compact_channel(channel, cutoff, cfg, db, client):
     msgs = db.old_messages(channel, cutoff)
     if not msgs:
         return None
     rendered = "\n".join(
         f"[{datetime.datetime.fromtimestamp(m['ts']):%d/%m %H:%M} "
-        f"{m['sender']}] {m['text']}" for m in msgs)[-12000:]
+        f"{m['sender']} · {m.get('tier') or m.get('role', '?')}] {m['text']}"
+        for m in msgs)[-12000:]
     turn_id = f"compact_{uuid.uuid4().hex[:8]}"
     t0 = time.time()
     resp = client.responses.create(
@@ -63,12 +82,13 @@ def compact_channel(channel, cutoff, cfg, db, client):
             reasoning_tokens=reasoning_tokens(resp.usage))
 
     db.set_summary(channel, data.get("summary", ""))
-    facts = [f for f in data.get("facts", []) if f]
+    facts = [fact_line(f, channel) for f in data.get("facts", []) if f]
+    facts = [f for f in facts if f]
     if facts:
         os.makedirs(cfg["memory_dir"], exist_ok=True)
         with open(os.path.join(cfg["memory_dir"], "facts.md"), "a") as f:
-            for fact in facts:
-                f.write(f"- {datetime.date.today()} [{channel}]: {fact}\n")
+            for line in facts:
+                f.write(line + "\n")
     db.delete_old(channel, cutoff)
     db.step(turn_id, "compacted", channel=channel,
             messages=len(msgs), facts=len(facts))

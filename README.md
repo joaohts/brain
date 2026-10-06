@@ -62,9 +62,16 @@ without `--enable`. To keep the services running without a login session, run
   rolling summary and recent window, plus a one-line "blackboard" of the
   other active channels. It then calls the model and runs tool calls, up to
   `max_tool_steps`.
-- **Tiers gate tools**: tools above the sender's tier are left out of the
-  schema entirely, and execution checks again (`brain/tools.py`). The runtime
-  stamps identity; the model never writes it.
+- **Tiers**: `owner`, `family` (known contacts), `agent` (workers and other
+  agents; never owner) and `unknown`. Tools a tier can't use are left out of
+  the schema entirely, and execution checks again (`brain/tools.py`). The
+  runtime stamps identity; the model never writes it. Only owner turns see
+  the other conversations, the channel list and the ability to message agents.
+  Durable memory is shown to owner and agent turns only. An agent turn can use
+  the comms read tools and deliver to its origin channel, nothing else.
+- **Prompt** (`brain/prompts.py`): one composer, one home per rule. The job
+  and priorities come first, then the persona (`identity_file`: tone and
+  language only), memory, the conversation summary, and what this turn is.
 - **State** (`data/brain.db`, SQLite) holds every step traced with tokens and
   cost, thread histories, timers and summaries. `brain.compact` folds old turns
   into per-channel summaries and appends durable facts to
@@ -138,6 +145,7 @@ clear message.
 | | `reasoning_effort` | `medium` | passed on every model call |
 | | `daily_budget_usd` | `1.0` | spend cap per day; `0` disables it |
 | `[limits]` | `max_tool_steps`, `window_turns`, `auto_compact_turns`, `blackboard_hours`, `blackboard_max_lines` | 6, 20, 40, 4, 12 | context and loop limits |
+| `[messages]` | `budget_reached`, `out_of_steps`, `failure` | English | fixed replies sent without a model call; write them in your language (`{owner}`, `{request}`) |
 | `[server]` | `host` / `port` | `127.0.0.1` / `3401` | the `/turn` API (no auth: keep it on localhost) |
 | `[whatsapp]` `[comms]` `[calendar]` `[claude_sessions]` | `enabled` … | off | see Integrations |
 

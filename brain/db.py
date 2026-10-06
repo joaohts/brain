@@ -39,6 +39,9 @@ class DB:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(messages)")}
+        if "tier" not in cols:   # older databases
+            self.conn.execute("ALTER TABLE messages ADD COLUMN tier TEXT DEFAULT ''")
 
     # -- traces ------------------------------------------------------------
     def step(self, turn_id: str, step: str, channel: str = "", model: str = "",
@@ -59,9 +62,11 @@ class DB:
         return row[0]
 
     # -- threads -----------------------------------------------------------
-    def add_message(self, channel: str, role: str, sender: str, text: str):
-        self.conn.execute("INSERT INTO messages VALUES (?,?,?,?,?)",
-                          (time.time(), channel, role, sender, text))
+    def add_message(self, channel: str, role: str, sender: str, text: str,
+                    tier: str = ""):
+        self.conn.execute(
+            "INSERT INTO messages (ts, channel, role, sender, text, tier) "
+            "VALUES (?,?,?,?,?,?)", (time.time(), channel, role, sender, text, tier))
         self.conn.commit()
 
     def window(self, channel: str, n: int) -> list[dict]:
@@ -139,9 +144,10 @@ class DB:
 
     def old_messages(self, channel: str, cutoff_ts: float) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT ts, role, sender, text FROM messages WHERE channel=? AND ts<? "
-            "ORDER BY ts", (channel, cutoff_ts)).fetchall()
-        return [dict(ts=r[0], role=r[1], sender=r[2], text=r[3]) for r in rows]
+            "SELECT ts, role, sender, text, tier FROM messages WHERE channel=? "
+            "AND ts<? ORDER BY ts", (channel, cutoff_ts)).fetchall()
+        return [dict(ts=r[0], role=r[1], sender=r[2], text=r[3], tier=r[4] or "")
+                for r in rows]
 
     def delete_old(self, channel: str, cutoff_ts: float):
         self.conn.execute("DELETE FROM messages WHERE channel=? AND ts<?",

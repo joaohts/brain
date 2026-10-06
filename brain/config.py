@@ -78,6 +78,14 @@ INTEGRATIONS = {
     },
 }
 
+# Fixed replies sent without a model call. Write them in [agent] language.
+MESSAGES = {
+    "budget_reached": "I've reached today's spending limit, so I can't answer "
+                      "until tomorrow. {owner} can raise daily_budget_usd.",
+    "out_of_steps": "I ran out of steps before finishing this: {request}",
+    "failure": "Something failed on my side before I could answer: {request}",
+}
+
 SECTIONS = ("agent", "model", "limits", "server")
 PATH_KEYS = ("identity_file", "memory_dir", "db_path")
 INTEGRATION_PATHS = {"whatsapp": ("contacts_file", "auth_dir"),
@@ -119,13 +127,25 @@ def load(path=None) -> dict:
         for k in INTEGRATION_PATHS[name]:
             section[k] = _path(section[k])
         cfg[name] = section
-    unknown = set(raw) - set(SECTIONS) - set(INTEGRATIONS)
+    cfg["messages"] = dict(MESSAGES)
+    for k, v in raw.get("messages", {}).items():
+        if k not in MESSAGES:
+            raise ConfigError(f"[messages] unknown key: {k}")
+        cfg["messages"][k] = v
+    unknown = set(raw) - set(SECTIONS) - set(INTEGRATIONS) - {"messages"}
     if unknown:
         raise ConfigError(f"unknown config section(s): {', '.join(sorted(unknown))}")
     for k in PATH_KEYS:
         cfg[k] = _path(cfg[k])
     validate(cfg)
     return cfg
+
+
+def message(cfg, key: str, **values) -> str:
+    """A configured fixed reply with {owner}/{request} filled in."""
+    values.setdefault("owner", cfg["owner_name"])
+    values.setdefault("request", "")
+    return cfg["messages"][key].format(**values)
 
 
 def enabled(cfg, name: str) -> bool:
