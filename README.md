@@ -159,6 +159,13 @@ messages are journaled durably in `state_path`, run as turns on channel
 starting with `NO_REPLY` is suppressed, which breaks agent-to-agent ack loops.
 Peer text reaches the model as quoted data, not as instructions.
 
+`send_to` is the only send tool; for comms channels it goes through the node
+socket and returns the real message id and state. Owner and agent-tier turns
+also get read-only inspection tools: `comms_who` (addresses and exact
+recipient ids), `comms_status`, `comms_log` and `comms_inbox` (neither
+consumes mail). Pairing, grants and identity changes stay manual `comms`
+admin.
+
 ### Claude Code sessions (`[claude_sessions]`)
 
 The `claude_spawn` / `claude_list` / `claude_kill` tools (owner tier) start
