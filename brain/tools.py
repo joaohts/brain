@@ -68,11 +68,19 @@ def deliver(channel: str, message: str, origin: str, cfg, db,
         stamped = (f"{message}\n[{origin}; replies return through "
                    f"{cfg['comms']['alias']} to that channel]"
                    if origin.startswith("relayed from ") else message)
+        # a message to a worker is a follow-up: wake it before the send so
+        # the idle reaper can't end it while it works on this
+        store = _worker_store(cfg)
+        taken = store.take_followup(target) if store else None
         result = deliver_v1(target, stamped)
         if not result["ok"]:
+            if taken:
+                store.drop_followup(*taken)
             return result["error"]
         status = (f"sent on comms-v1 to {target}: id {result['id']}, "
                   f"state {result['state']}")
+        if taken:
+            status += f"; worker session-{taken[0]} is awake until its next [FINAL]"
     elif channel == "cli":
         status = "delivered on cli"
     else:
@@ -81,6 +89,19 @@ def deliver(channel: str, message: str, origin: str, cfg, db,
         db.add_message(channel, "assistant",
                        f"{cfg['assistant_name']} ({origin})", message)
     return status
+
+
+def _worker_store(cfg):
+    """The worker table: the running dispatcher's, else (another process,
+    e.g. the CLI) the same database file."""
+    from . import inbox
+    brain = inbox.current()
+    if brain:
+        return brain.store
+    try:
+        return inbox.Store(cfg["db_path"])
+    except Exception:
+        return None
 
 
 def _memory_path(cfg):

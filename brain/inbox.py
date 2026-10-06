@@ -21,8 +21,9 @@ something gets answered.
   rows addressed to the ORIGIN thread at tier "agent", and their reply is
   delivered to the origin channel. A worker whose result was marked final
   goes idle once that result is delivered: it stays reachable for follow-ups
-  for [claude_sessions] idle_minutes (any new report re-arms it), then is
-  reaped. idle_minutes = 0 reaps at once.
+  for [claude_sessions] idle_minutes, then is reaped (idle_minutes = 0 reaps
+  at once). Sending it a follow-up wakes it before the send and cancels the
+  deadline until it answers with a new [FINAL], which re-arms the period.
 """
 
 from __future__ import annotations
@@ -78,7 +79,8 @@ CREATE TABLE IF NOT EXISTS workers (
   request TEXT NOT NULL,
   state TEXT NOT NULL,
   created_at REAL NOT NULL,
-  idle_until REAL
+  idle_until REAL,
+  pending INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS workers_recipient ON workers(recipient);
 """
@@ -112,6 +114,12 @@ class Store:
                 "PRAGMA table_info(workers)")}
             if "idle_until" not in cols:
                 self.conn.execute("ALTER TABLE workers ADD COLUMN idle_until REAL")
+            if "pending" not in cols:
+                # a worker still on its task owes that task's [FINAL]
+                self.conn.execute("ALTER TABLE workers ADD COLUMN pending "
+                                  "INTEGER NOT NULL DEFAULT 0")
+                self.conn.execute("UPDATE workers SET pending=1 WHERE "
+                                  "state IN ('starting','running')")
 
     def _tx(self):
         store = self
@@ -260,8 +268,8 @@ class Store:
     def add_worker(self, sid, origin_channel, origin_thread, origin_sender, request):
         with self._tx() as c:
             c.execute("INSERT OR REPLACE INTO workers(sid,recipient,origin_channel,"
-                      "origin_thread,origin_sender,request,state,created_at) "
-                      "VALUES(?,NULL,?,?,?,?,'starting',?)",
+                      "origin_thread,origin_sender,request,state,created_at,"
+                      "pending) VALUES(?,NULL,?,?,?,?,'starting',?,1)",
                       (sid, origin_channel, origin_thread or "", origin_sender,
                        request[:500], time.time()))
 
@@ -283,6 +291,76 @@ class Store:
             return [r["sid"] for r in self.conn.execute(
                 "SELECT sid FROM workers WHERE state='idle' AND idle_until<=?",
                 (now,))]
+
+    # A worker's `pending` counts the tasks it owes a [FINAL] for: its spawn
+    # task plus each follow-up handed to it. It is idle (and reapable) only
+    # while it owes none, so a [FINAL] that crossed a newer follow-up can't
+    # park a worker that is busy with that follow-up.
+
+    def take_followup(self, target: str) -> tuple[str, dict] | None:
+        """A message is about to go to comms `target`. If that is a live
+        worker, wake it before the send: it leaves idle (no deadline) and owes
+        one more [FINAL]. Returns (sid, previous fields) or None."""
+        last = target.rsplit(":", 1)[-1]
+        sid = last[len("session-"):] if last.startswith("session-") else None
+        with self._tx() as c:
+            w = c.execute(
+                "SELECT * FROM workers WHERE (recipient=? OR sid=?) AND state "
+                "NOT IN ('reaped','failed') ORDER BY created_at DESC LIMIT 1",
+                (target, sid)).fetchone()
+            if not w:
+                return None
+            c.execute("UPDATE workers SET pending=pending+1, idle_until=NULL, "
+                      "state=CASE state WHEN 'idle' THEN 'running' ELSE state "
+                      "END WHERE sid=?", (w["sid"],))
+            return w["sid"], {k: w[k] for k in ("state", "idle_until")}
+
+    def drop_followup(self, sid: str, prev: dict):
+        """The follow-up was never handed off: undo take_followup."""
+        with self._tx() as c:
+            c.execute("UPDATE workers SET pending=MAX(pending-1,0) WHERE sid=?",
+                      (sid,))
+            if prev["state"] == "idle":
+                c.execute("UPDATE workers SET state='idle', idle_until=? WHERE "
+                          "sid=? AND state='running' AND pending=0",
+                          (prev["idle_until"], sid))
+
+    def worker_final(self, sid: str, idle_until: float | None) -> str | None:
+        """A [FINAL] reached the origin: settle one owed task. Once none is
+        owed the worker parks until idle_until (None: reaped at once).
+        Returns the new state, or None while it still has work."""
+        with self._tx() as c:
+            c.execute("UPDATE workers SET pending=MAX(pending-1,0) WHERE sid=? "
+                      "AND state NOT IN ('reaped','failed')", (sid,))
+            w = c.execute("SELECT state, pending FROM workers WHERE sid=?",
+                          (sid,)).fetchone()
+            if not w or w["state"] in ("reaped", "failed") or w["pending"]:
+                return None
+            state = "idle" if idle_until else "reaped"
+            c.execute("UPDATE workers SET state=?, idle_until=? WHERE sid=?",
+                      (state, idle_until, sid))
+            return state
+
+    def worker_progress(self, sid: str):
+        """A progress report: the worker is working, whatever we knew."""
+        with self._tx() as c:
+            c.execute("UPDATE workers SET state='running', idle_until=NULL, "
+                      "pending=MAX(pending,1) WHERE sid=? AND state='idle'",
+                      (sid,))
+
+    def claim_reap(self, sid: str, now: float | None = None) -> bool:
+        """Mark the worker reaped; with `now`, only if it is still idle past
+        its deadline (a follow-up may have woken it since it was listed)."""
+        with self._tx() as c:
+            if now is None:
+                cur = c.execute("UPDATE workers SET state='reaped', idle_until="
+                                "NULL, pending=0 WHERE sid=? AND state<>'reaped'",
+                                (sid,))
+            else:
+                cur = c.execute("UPDATE workers SET state='reaped', idle_until="
+                                "NULL, pending=0 WHERE sid=? AND state='idle' "
+                                "AND idle_until<=?", (sid, now))
+            return cur.rowcount == 1
 
     def worker(self, sid: str) -> dict | None:
         with self.lock:
@@ -532,9 +610,10 @@ class Brain:
                 self.db.step(turn_id, "route_error", channel=row["channel"],
                              route=row["route"], error=f"{type(e).__name__}: {e}")
         # a final worker result was handed to its origin (directly, or merged
-        # into the origin's own turn whose reply carries it): the worker goes
-        # idle, reachable for follow-ups until idle_minutes pass. A progress
-        # report from an idle worker (it took a follow-up) wakes it again.
+        # into the origin's own turn whose reply carries it): once the worker
+        # owes no other [FINAL] it goes idle, reachable for follow-ups until
+        # idle_minutes pass. Handing it a follow-up (tools.deliver) wakes it
+        # before the send; so does a progress report.
         if row["kind"] == "worker_result" and not error:
             if meta.get("final") and (delivered or row["merged"]):
                 self.park(meta.get("worker_sid"), turn_id)
@@ -546,34 +625,35 @@ class Brain:
                           .get("idle_minutes", 0) or 0)
 
     def park(self, sid: str | None, turn_id: str = ""):
-        idle = self.idle_seconds()
-        if idle <= 0:
-            return self.reap(sid, turn_id)
-        w = self.store.worker(sid) if sid else None
-        if not w or w["state"] == "reaped":
-            return
-        self.store.set_worker(sid, state="idle", idle_until=time.time() + idle)
-        self.db.step(turn_id, "worker_idle", channel=w["origin_channel"],
-                     session=sid, idle_seconds=idle)
-
-    def wake(self, sid: str | None):
-        w = self.store.worker(sid) if sid else None
-        if w and w["state"] == "idle":
-            self.store.set_worker(sid, state="running", idle_until=None)
-
-    def reap_idle(self, now: float | None = None):
-        for sid in self.store.idle_expired(time.time() if now is None else now):
-            self.reap(sid, "")
-
-    def reap(self, sid: str | None, turn_id: str = ""):
         if not sid:
             return
+        idle = self.idle_seconds()
         w = self.store.worker(sid)
-        if not w or w["state"] == "reaped":
-            return
-        self.store.set_worker(sid, state="reaped", idle_until=None)
+        state = self.store.worker_final(
+            sid, time.time() + idle if idle > 0 else None)
+        if state == "idle":
+            self.db.step(turn_id, "worker_idle", channel=w["origin_channel"],
+                         session=sid, idle_seconds=idle)
+        elif state == "reaped":
+            self._killed(w, turn_id)
+
+    def wake(self, sid: str | None):
+        if sid:
+            self.store.worker_progress(sid)
+
+    def reap_idle(self, now: float | None = None):
+        now = time.time() if now is None else now
+        for sid in self.store.idle_expired(now):
+            if self.store.claim_reap(sid, now):
+                self._killed(self.store.worker(sid), "")
+
+    def reap(self, sid: str | None, turn_id: str = ""):
+        if sid and self.store.claim_reap(sid):
+            self._killed(self.store.worker(sid), turn_id)
+
+    def _killed(self, w: dict, turn_id: str):
         self.db.step(turn_id, "worker_reaped", channel=w["origin_channel"],
-                     session=sid)
+                     session=w["sid"])
         from .tools import kill_session
-        threading.Thread(target=kill_session, args=(self.cfg, sid),
+        threading.Thread(target=kill_session, args=(self.cfg, w["sid"]),
                          daemon=True).start()

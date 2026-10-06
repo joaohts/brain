@@ -121,8 +121,11 @@ sender's own tier.
   merged into it; otherwise it starts a turn there. A worker whose report
   starts with `[FINAL]` goes idle once that report has reached the origin:
   it stays up with its context for `idle_minutes` (default 15) so follow-ups
-  sent to it over comms still work, and any new report re-arms the timer.
-  After that it is reaped. `claude_kill` ends one at any time.
+  sent to it over comms still work. After that it is reaped. Sending it a
+  follow-up wakes it before the send and cancels the deadline: it is not
+  reaped, however long it works silently, until a new `[FINAL]` answers
+  every follow-up it was sent, which starts a fresh idle period. A
+  progress report also wakes it. `claude_kill` ends one at any time.
   When a spawn fails, a `spawn FAILED: …` note lands in the origin
   conversation so the requester is told.
 

@@ -360,6 +360,123 @@ class WorkerTests(Base):
         time.sleep(0.05)
         self.assertEqual(self.killed, ["w1"])
 
+    def followup(self, target="comms-v1:m_x:a_w", ok=True):
+        """send_to a worker over comms, the node stubbed."""
+        from brain import comms_v1
+        saved = comms_v1.deliver
+        sent = []
+
+        def fake(t, m):
+            sent.append((t, self.brain.store.worker("w1")["state"]))
+            return ({"ok": True, "id": "msg", "state": "queued"} if ok
+                    else {"ok": False, "error": "comms-v1: node_unavailable"})
+        comms_v1.deliver = fake
+        self.cfg["comms"]["enabled"] = True
+        try:
+            out = tools.execute("send_to", {"channel": "cli", "tier": "owner",
+                                            "sender": "Owner", "turn_id": "t"},
+                                {"channel": target, "message": "and also?"},
+                                self.cfg, self.db)
+        finally:
+            comms_v1.deliver = saved
+        return out, sent
+
+    def final(self, body="[FINAL] done", pid="comms:m_x:f1"):
+        self.submit_worker(body, pid=pid)
+        self.client.script = [(text("ok"), None)]
+        self.brain.drain()
+
+    def assertBusy(self, sid="w1"):
+        w = self.brain.store.worker(sid)
+        self.assertEqual((w["state"], w["idle_until"]), ("running", None))
+        self.brain.reap_idle(now=time.time() + 24 * 3600)
+        time.sleep(0.05)
+        self.assertEqual(self.killed, [])
+
+    def test_follow_up_wakes_the_worker_before_the_send_near_its_deadline(self):
+        self.worker()
+        self.final()
+        deadline = self.brain.store.worker("w1")["idle_until"]
+        out, sent = self.followup()
+        self.assertEqual(sent, [("m_x:a_w", "running")])   # woken before the send
+        self.assertIn("worker session-w1 is awake", out)
+        # silent work long past the old deadline: never reaped
+        self.assertBusy()
+        self.brain.reap_idle(now=deadline + 1)
+        # its next [FINAL] starts a fresh idle period, then it is reaped
+        self.final("[FINAL] follow-up answered", pid="comms:m_x:f2")
+        self.assertIdleThenReaped()
+
+    def test_follow_up_by_address_wakes_the_worker(self):
+        self.worker()
+        self.final()
+        self.followup(target="comms-v1:pi:session-w1")
+        self.assertBusy()
+
+    def test_follow_up_to_a_running_worker_outlives_its_crossing_final(self):
+        """The worker's [FINAL] for the task crossed the follow-up: it is
+        processed after the follow-up went out, so it must not park it."""
+        self.worker()
+        self.submit_worker("[FINAL] done", pid="comms:m_x:f1")   # not yet handled
+        self.followup()
+        self.client.script = [(text("ok"), None)]
+        self.brain.drain()
+        self.assertBusy()
+        self.final("[FINAL] follow-up answered", pid="comms:m_x:f2")
+        self.assertIdleThenReaped()
+
+    def test_follow_up_sent_in_the_turn_that_merges_the_final(self):
+        self.worker()
+        self.submit("anything from the worker?")
+        self.client.script = [
+            (call("send_to", {"channel": "comms-v1:m_x:a_w", "message": "x"}),
+             lambda: self.submit_worker("[FINAL] done", pid="comms:m_x:f1")),
+            (text("asked it more"), None)]
+        from brain import comms_v1
+        saved, comms_v1.deliver = comms_v1.deliver, lambda t, m: {
+            "ok": True, "id": "msg", "state": "queued"}
+        self.cfg["comms"]["enabled"] = True
+        try:
+            self.brain.drain()
+        finally:
+            comms_v1.deliver = saved
+        self.assertEqual(self.brain.store.get(1)["reply"], "asked it more")
+        self.assertBusy()
+
+    def test_failed_follow_up_send_leaves_the_worker_idle(self):
+        self.worker()
+        self.final()
+        deadline = self.brain.store.worker("w1")["idle_until"]
+        out, _ = self.followup(ok=False)
+        self.assertIn("node_unavailable", out)
+        w = self.brain.store.worker("w1")
+        self.assertEqual((w["state"], w["idle_until"], w["pending"]),
+                         ("idle", deadline, 0))
+
+    def test_reaper_that_listed_a_worker_loses_to_a_follow_up(self):
+        self.worker()
+        self.final()
+        late = self.brain.store.worker("w1")["idle_until"] + 1
+        self.assertEqual(self.brain.store.idle_expired(late), ["w1"])
+        self.followup()
+        self.assertFalse(self.brain.store.claim_reap("w1", late))
+        self.assertBusy()
+
+    def test_follow_up_to_a_reaped_worker_is_just_sent(self):
+        self.worker()
+        self.brain.reap("w1")
+        out, _ = self.followup()
+        self.assertNotIn("awake", out)
+        self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
+
+    def test_claude_kill_ends_a_busy_worker_at_once(self):
+        self.worker()
+        self.followup()
+        tools.t_claude_kill({}, {"session_id": "session-w1"}, self.cfg, self.db)
+        self.assertEqual(self.killed, ["w1"])
+        self.final()   # a late [FINAL] doesn't resurrect it
+        self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
+
     def test_old_workers_table_is_migrated(self):
         import sqlite3
         path = os.path.join(self.tmp.name, "old.db")
@@ -372,6 +489,7 @@ class WorkerTests(Base):
         c.commit(); c.close()
         store = inbox.Store(path)
         self.assertIsNone(store.worker("old")["idle_until"])
+        self.assertEqual(store.worker("old")["pending"], 1)   # owes its [FINAL]
         store.set_worker("old", state="idle", idle_until=1.0)
         self.assertEqual(store.idle_expired(2.0), ["old"])
 
