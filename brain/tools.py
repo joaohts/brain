@@ -205,6 +205,25 @@ def kill_session(cfg, sid: str) -> str:
     return r.stdout.strip() or r.stderr.strip() or f"killed {sid}"
 
 
+def _after_final(cfg) -> str:
+    """Worker instructions for after its [FINAL] report."""
+    idle = cfg["claude_sessions"].get("idle_minutes", 0) or 0
+    if idle <= 0:
+        return ("After the final report is sent (and any handoffs "
+                "acknowledged), close comms and end this session with /exit — "
+                "finished workers are reaped.")
+    return (f"After the final report, do NOT close comms or /exit: stay idle "
+            f"and keep your context, since follow-ups may arrive over comms "
+            f"for about {idle:g} minutes. Answer a follow-up like the original "
+            f"task (start its last report with {_final_mark()} again). The "
+            f"session is closed for you once it stays idle that long.")
+
+
+def _final_mark() -> str:
+    from .inbox import FINAL_MARK
+    return FINAL_MARK
+
+
 SPAWN_POLL_SECONDS = 3
 SPAWN_POLL_ATTEMPTS = 20
 
@@ -239,9 +258,7 @@ def _spawn_job(origin: dict, task_text: str, cwd: str, cfg, db):
             f"you for a task that came from channel {origin['channel']}. Report "
             f"progress sparingly via comms to {cfg['comms']['alias']}; start your "
             f"final report with {inbox.FINAL_MARK}. Each report is relayed to "
-            f"that channel. After the final report is sent (and any handoffs "
-            f"acknowledged), close comms and end this session with /exit — "
-            f"finished workers are reaped. Task: {task_text}")
+            f"that channel. {_after_final(cfg)} Task: {task_text}")
     # Wait for the exact new local agent's harness-owned receiver, then
     # submit to its immutable id with an idempotent task id.
     for attempt in range(SPAWN_POLL_ATTEMPTS):
@@ -361,7 +378,11 @@ def _norm_sid(sid):
 
 
 def t_claude_kill(env, args, cfg, db):
+    from . import inbox
     sid = _norm_sid(args["session_id"])
+    brain = inbox.current()
+    if brain and brain.store.worker(sid):
+        brain.store.set_worker(sid, state="reaped", idle_until=None)
     return kill_session(cfg, sid)
 
 

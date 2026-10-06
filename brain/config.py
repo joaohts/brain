@@ -75,6 +75,7 @@ INTEGRATIONS = {
         "enabled": False,
         "script": "scripts/claude-sessions.sh",
         "source": "brain",
+        "idle_minutes": 15,     # linger after [FINAL] for follow-ups; 0 = reap at once
     },
 }
 

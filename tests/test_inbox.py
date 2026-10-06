@@ -273,9 +273,7 @@ class WorkerTests(Base):
         self.assertEqual((r["channel"], r["tier"], r["reply"]),
                          ("cli", "agent", "The logs show 3 errors."))
         self.assertEqual(len(self.steps("origin_delivery")), 1)
-        self.wait_reaped()
-        self.assertEqual(self.killed, ["w1"])
-        self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
+        self.assertIdleThenReaped()
 
     def test_progress_result_is_delivered_but_not_reaped(self):
         self.worker()
@@ -299,8 +297,83 @@ class WorkerTests(Base):
         self.assertEqual(self.brain.store.get(head)["reply"], "Yes: all good.")
         w = self.brain.store.get(wrow[0])
         self.assertEqual((w["merged"], w["reply"]), (1, ""))
+        self.assertIdleThenReaped()
+
+    def assertIdleThenReaped(self, sid="w1"):
+        """A final result parks the worker for idle_minutes; it stays routable
+        and is reaped only once the idle period has passed."""
+        w = self.brain.store.worker(sid)
+        self.assertEqual(w["state"], "idle")
+        self.assertAlmostEqual(w["idle_until"] - time.time(), 15 * 60, delta=30)
+        self.assertEqual(self.brain.store.worker_by_recipient(w["recipient"])["sid"], sid)
+        self.brain.reap_idle(now=w["idle_until"] - 1)
+        time.sleep(0.05)
+        self.assertEqual(self.killed, [])
+        self.brain.reap_idle(now=w["idle_until"] + 1)
+        self.wait_reaped()
+        self.assertEqual(self.killed, [sid])
+        self.assertEqual(self.brain.store.worker(sid)["state"], "reaped")
+
+    def test_idle_minutes_zero_reaps_at_once(self):
+        self.cfg["claude_sessions"]["idle_minutes"] = 0
+        self.worker()
+        self.submit_worker("[FINAL] done")
+        self.client.script = [(text("Done."), None)]
+        self.brain.drain()
         self.wait_reaped()
         self.assertEqual(self.killed, ["w1"])
+        self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
+
+    def test_follow_up_wakes_an_idle_worker_and_final_rearms_it(self):
+        self.worker()
+        self.submit_worker("[FINAL] done", pid="comms:m_x:m1")
+        self.client.script = [(text("Done."), None)]
+        self.brain.drain()
+        first = self.brain.store.worker("w1")["idle_until"]
+        # the worker took a follow-up: its progress report wakes it
+        self.submit_worker("looking into the follow-up", pid="comms:m_x:m2")
+        self.client.script = [(text("On it."), None)]
+        self.brain.drain()
+        w = self.brain.store.worker("w1")
+        self.assertEqual((w["state"], w["idle_until"]), ("running", None))
+        self.brain.reap_idle(now=first + 3600)
+        time.sleep(0.05)
+        self.assertEqual(self.killed, [])
+        # its next final report parks it again with a fresh deadline
+        time.sleep(0.01)
+        self.submit_worker("[FINAL] follow-up answered", pid="comms:m_x:m3")
+        self.client.script = [(text("Answered."), None)]
+        self.brain.drain()
+        w = self.brain.store.worker("w1")
+        self.assertEqual(w["state"], "idle")
+        self.assertGreater(w["idle_until"], first)
+
+    def test_claude_kill_ends_an_idle_worker_at_once(self):
+        self.worker()
+        self.brain.park("w1")
+        out = tools.t_claude_kill({}, {"session_id": "session-w1"}, self.cfg, self.db)
+        self.assertEqual(out, "killed")
+        self.assertEqual(self.killed, ["w1"])
+        self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
+        self.assertIsNone(self.brain.store.worker_by_recipient("m_x:a_w"))
+        self.brain.reap_idle(now=time.time() + 3600)
+        time.sleep(0.05)
+        self.assertEqual(self.killed, ["w1"])
+
+    def test_old_workers_table_is_migrated(self):
+        import sqlite3
+        path = os.path.join(self.tmp.name, "old.db")
+        c = sqlite3.connect(path)
+        c.execute("CREATE TABLE workers (sid TEXT PRIMARY KEY, recipient TEXT, "
+                  "origin_channel TEXT NOT NULL, origin_thread TEXT NOT NULL "
+                  "DEFAULT '', origin_sender TEXT NOT NULL, request TEXT NOT "
+                  "NULL, state TEXT NOT NULL, created_at REAL NOT NULL)")
+        c.execute("INSERT INTO workers VALUES('old','r','cli','','o','q','running',0)")
+        c.commit(); c.close()
+        store = inbox.Store(path)
+        self.assertIsNone(store.worker("old")["idle_until"])
+        store.set_worker("old", state="idle", idle_until=1.0)
+        self.assertEqual(store.idle_expired(2.0), ["old"])
 
     def test_worker_result_waits_for_another_senders_turn_then_handed_off(self):
         self.worker(origin="cli")
@@ -368,6 +441,13 @@ class SpawnTests(Base):
         self.assertEqual((w["sid"], w["origin_channel"], w["state"]),
                          ("brain-1a2b", "wpp:owner", "running"))
         self.assertIn(inbox.FINAL_MARK, self.posted[0][1])
+        self.assertIn("do NOT close comms or /exit", self.posted[0][1])
+        self.assertIn("about 15 minutes", self.posted[0][1])
+
+    def test_spawn_with_no_idle_keeps_exit_instruction(self):
+        self.cfg["claude_sessions"]["idle_minutes"] = 0
+        self.spawn()
+        self.assertIn("end this session with /exit", self.posted[0][1])
 
     def test_spawn_failure_lands_in_the_origin_thread(self):
         def boom(cfg, cwd):

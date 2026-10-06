@@ -119,7 +119,10 @@ sender's own tier.
   `send_to` toward its origin. The reply to a worker report is delivered to
   the origin channel. If the origin's own turn is running, the report is
   merged into it; otherwise it starts a turn there. A worker whose report
-  starts with `[FINAL]` is reaped once that report has reached the origin.
+  starts with `[FINAL]` goes idle once that report has reached the origin:
+  it stays up with its context for `idle_minutes` (default 15) so follow-ups
+  sent to it over comms still work, and any new report re-arms the timer.
+  After that it is reaped. `claude_kill` ends one at any time.
   When a spawn fails, a `spawn FAILED: …` note lands in the origin
   conversation so the requester is told.
 
@@ -250,6 +253,9 @@ Its reports are routed to the conversation that asked for the work (see
 and its `/open-comms` skill. If a spawn can't come up (login expired, claude
 exited, no comms receiver), the tool returns `spawn FAILED: …` quickly instead
 of promising a follow-up.
+
+`idle_minutes` (default 15) is how long a worker lingers after its `[FINAL]`
+report before it is killed; `0` restores the old reap-at-once behaviour.
 
 ### Calendar (`[calendar]`)
 

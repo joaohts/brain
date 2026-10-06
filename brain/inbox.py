@@ -19,8 +19,10 @@ something gets answered.
   watermark, so out-of-order commits can't skip a message.
 - Worker results (messages from Claude sessions the brain spawned) become
   rows addressed to the ORIGIN thread at tier "agent", and their reply is
-  delivered to the origin channel. A worker whose result was marked final is
-  reaped once that result is delivered.
+  delivered to the origin channel. A worker whose result was marked final
+  goes idle once that result is delivered: it stays reachable for follow-ups
+  for [claude_sessions] idle_minutes (any new report re-arms it), then is
+  reaped. idle_minutes = 0 reaps at once.
 """
 
 from __future__ import annotations
@@ -75,7 +77,8 @@ CREATE TABLE IF NOT EXISTS workers (
   origin_sender TEXT NOT NULL,
   request TEXT NOT NULL,
   state TEXT NOT NULL,
-  created_at REAL NOT NULL
+  created_at REAL NOT NULL,
+  idle_until REAL
 );
 CREATE INDEX IF NOT EXISTS workers_recipient ON workers(recipient);
 """
@@ -105,6 +108,10 @@ class Store:
         self.lock = threading.RLock()
         with self.lock:
             self.conn.executescript(SCHEMA)
+            cols = {r["name"] for r in self.conn.execute(
+                "PRAGMA table_info(workers)")}
+            if "idle_until" not in cols:
+                self.conn.execute("ALTER TABLE workers ADD COLUMN idle_until REAL")
 
     def _tx(self):
         store = self
@@ -271,6 +278,12 @@ class Store:
                 "ORDER BY created_at DESC LIMIT 1", (recipient,)).fetchone()
         return dict(r) if r else None
 
+    def idle_expired(self, now: float) -> list[str]:
+        with self.lock:
+            return [r["sid"] for r in self.conn.execute(
+                "SELECT sid FROM workers WHERE state='idle' AND idle_until<=?",
+                (now,))]
+
     def worker(self, sid: str) -> dict | None:
         with self.lock:
             r = self.conn.execute("SELECT * FROM workers WHERE sid=?",
@@ -360,6 +373,7 @@ class Brain:
                 while not self._stop.wait(tick):
                     if self.store.has_unread(self.routes):
                         self.kick()
+                    self.reap_idle()
             self._ticker = threading.Thread(target=loop, daemon=True,
                                             name="inbox-ticker")
             self._ticker.start()
@@ -518,10 +532,38 @@ class Brain:
                 self.db.step(turn_id, "route_error", channel=row["channel"],
                              route=row["route"], error=f"{type(e).__name__}: {e}")
         # a final worker result was handed to its origin (directly, or merged
-        # into the origin's own turn whose reply carries it): reap the worker
-        if (row["kind"] == "worker_result" and meta.get("final") and not error
-                and (delivered or row["merged"])):
-            self.reap(meta.get("worker_sid"), turn_id)
+        # into the origin's own turn whose reply carries it): the worker goes
+        # idle, reachable for follow-ups until idle_minutes pass. A progress
+        # report from an idle worker (it took a follow-up) wakes it again.
+        if row["kind"] == "worker_result" and not error:
+            if meta.get("final") and (delivered or row["merged"]):
+                self.park(meta.get("worker_sid"), turn_id)
+            elif not meta.get("final"):
+                self.wake(meta.get("worker_sid"))
+
+    def idle_seconds(self) -> float:
+        return 60 * float(self.cfg.get("claude_sessions", {})
+                          .get("idle_minutes", 0) or 0)
+
+    def park(self, sid: str | None, turn_id: str = ""):
+        idle = self.idle_seconds()
+        if idle <= 0:
+            return self.reap(sid, turn_id)
+        w = self.store.worker(sid) if sid else None
+        if not w or w["state"] == "reaped":
+            return
+        self.store.set_worker(sid, state="idle", idle_until=time.time() + idle)
+        self.db.step(turn_id, "worker_idle", channel=w["origin_channel"],
+                     session=sid, idle_seconds=idle)
+
+    def wake(self, sid: str | None):
+        w = self.store.worker(sid) if sid else None
+        if w and w["state"] == "idle":
+            self.store.set_worker(sid, state="running", idle_until=None)
+
+    def reap_idle(self, now: float | None = None):
+        for sid in self.store.idle_expired(time.time() if now is None else now):
+            self.reap(sid, "")
 
     def reap(self, sid: str | None, turn_id: str = ""):
         if not sid:
@@ -529,7 +571,7 @@ class Brain:
         w = self.store.worker(sid)
         if not w or w["state"] == "reaped":
             return
-        self.store.set_worker(sid, state="reaped")
+        self.store.set_worker(sid, state="reaped", idle_until=None)
         self.db.step(turn_id, "worker_reaped", channel=w["origin_channel"],
                      session=sid)
         from .tools import kill_session

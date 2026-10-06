@@ -64,3 +64,5 @@ script = ""                         # executable implementing the contract in RE
 enabled = false
 script = "scripts/claude-sessions.sh"
 source = "brain"                    # session-name prefix
+idle_minutes = 15                   # after a [FINAL] report the worker stays up this
+                                    # long for follow-ups, then is killed; 0 = at once
