@@ -187,6 +187,10 @@ class AutocompactTests(unittest.TestCase):
             run()
             self.assertEqual(len(calls), 2)
 
+    def test_claude_sessions_requires_comms(self):
+        with self.assertRaises(config.ConfigError):
+            cfg_with("[claude_sessions]\nenabled = true\n")
+
     def test_window_must_be_below_threshold(self):
         with self.assertRaises(config.ConfigError):
             cfg_with("[limits]\nwindow_turns = 40\nauto_compact_turns = 40\n")

@@ -179,6 +179,9 @@ def validate(cfg) -> None:
         if not os.path.exists(c["socket"]):
             raise ConfigError(f"comms: node socket not found: {c['socket']} "
                               f"(is the comms node running?)")
+    if enabled(cfg, "claude_sessions") and not enabled(cfg, "comms"):
+        raise ConfigError("claude_sessions needs [comms] enabled: workers "
+                          "receive tasks and report back over comms")
     for name in ("calendar", "claude_sessions"):
         if enabled(cfg, name):
             s = cfg[name]["script"]
