@@ -21,6 +21,7 @@ from openai import OpenAI
 
 from . import config
 from .db import DB
+from .loop import _cost, reasoning_tokens
 
 PROMPT = """You are the memory-consolidation process of the assistant {assistant}.
 Input: the current summary of channel '{channel}' (may be empty) and old
@@ -57,7 +58,9 @@ def compact_channel(channel, cutoff, cfg, db, client):
     db.step(turn_id, "model", channel=channel, model=cfg["model"],
             ms=int((time.time() - t0) * 1000),
             tokens_in=resp.usage.input_tokens, tokens_out=resp.usage.output_tokens,
-            job="compact")
+            cost_usd=_cost(cfg, resp.usage), job="compact",
+            reasoning_effort=cfg["reasoning_effort"],
+            reasoning_tokens=reasoning_tokens(resp.usage))
 
     db.set_summary(channel, data.get("summary", ""))
     facts = [f for f in data.get("facts", []) if f]

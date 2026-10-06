@@ -123,5 +123,29 @@ class ToolGatingTests(unittest.TestCase):
             self.assertEqual(tools._norm_sid(raw), "brain-1a2b", raw)
 
 
+class CostTests(unittest.TestCase):
+    def test_compaction_records_cost_and_reasoning(self):
+        from types import SimpleNamespace as NS
+        from brain import compact
+        cfg = config.load(config.REPO / "config.example.toml")
+        usage = NS(input_tokens=1000, output_tokens=200,
+                   output_tokens_details=NS(reasoning_tokens=150))
+        resp = NS(output_text='{"summary": "s", "facts": []}', usage=usage)
+        client = NS(responses=NS(create=lambda **kw: resp))
+
+        class DB(FakeDB):
+            def old_messages(self, *a): return [{"ts": 0, "sender": "a", "text": "b"}]
+            def get_summary(self, *a): return ""
+            def set_summary(self, *a): pass
+            def delete_old(self, *a): pass
+
+        db = DB()
+        compact.compact_channel("cli", 1, cfg, db, client)
+        step = next(kw for a, kw in db.steps if a[1] == "model")
+        self.assertAlmostEqual(step["cost_usd"], (1000 * 0.10 + 200 * 0.50) / 1e6)
+        self.assertEqual(step["reasoning_tokens"], 150)
+        self.assertEqual(step["reasoning_effort"], "medium")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,12 @@ def _memory(cfg) -> str:
     return "\n".join(parts)[-4000:]  # v1: load-all, tail-capped; retrieval later
 
 
+def reasoning_tokens(usage) -> int:
+    """Reasoning tokens are a subset of output_tokens (already in _cost)."""
+    return getattr(getattr(usage, "output_tokens_details", None),
+                   "reasoning_tokens", 0) or 0
+
+
 def _cost(cfg, usage) -> float:
     return (usage.input_tokens * cfg["price_in_per_mtok"]
             + usage.output_tokens * cfg["price_out_per_mtok"]) / 1e6
@@ -161,7 +167,9 @@ def _run(env, cfg, db, client):
         db.step(turn_id, "model", channel=env["channel"], model=cfg["model"],
                 ms=int((time.time() - t_model) * 1000),
                 tokens_in=u.input_tokens, tokens_out=u.output_tokens,
-                cost_usd=_cost(cfg, u), status=resp.status)
+                cost_usd=_cost(cfg, u), status=resp.status,
+                reasoning_effort=cfg["reasoning_effort"],
+                reasoning_tokens=reasoning_tokens(u))
         calls = [it for it in resp.output if it.type == "function_call"]
         if not calls:
             final = resp.output_text or ""
