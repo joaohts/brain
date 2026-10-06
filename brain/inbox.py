@@ -25,6 +25,14 @@ something gets answered.
   (no report, follow-up or pane output) for [claude_sessions] idle_minutes;
   idle_minutes = 0 reaps at [FINAL]. Sending it a follow-up wakes it before
   the send.
+- Spending caps (brain/budget.py) are checked before a turn starts. While
+  one is reached, the next unread row is held instead of answered: the row
+  finishes (its sender gets the budget_reached notice, at most once per
+  channel per cap period, otherwise an empty reply) and, in the same
+  transaction, a copy is stored in state `held`, addressed to the row's
+  origin channel. Once spend is back under every cap the held copies become
+  unread again, oldest first, and their replies are delivered to that
+  channel. A turn already running is never cut short by a cap.
 """
 
 from __future__ import annotations
@@ -87,6 +95,12 @@ CREATE TABLE IF NOT EXISTS workers (
   last_active REAL
 );
 CREATE INDEX IF NOT EXISTS workers_recipient ON workers(recipient);
+CREATE TABLE IF NOT EXISTS budget_notices (
+  channel TEXT NOT NULL,
+  period TEXT NOT NULL,
+  ts REAL NOT NULL,
+  PRIMARY KEY (channel, period)
+);
 """
 
 
@@ -214,6 +228,45 @@ class Store:
         with self._tx() as c:
             c.execute("UPDATE inbox SET state='done', reply=?, error=?, "
                       "done_at=? WHERE id=?", (reply, error, time.time(), row_id))
+
+    def hold(self, row: dict, period: str, notice: str) -> tuple[int, str] | None:
+        """Hold an unread row while a spending cap is reached: finish it and,
+        atomically, store a `held` copy addressed to its origin channel.
+        Returns (copy id, reply for the original: `notice` the first time
+        this channel hears of this cap period, else ""), or None if the row
+        was no longer unread."""
+        meta = dict(row["meta"])
+        origin = meta.get("deliver_to") or row["channel"]
+        meta.update(deliver_to=origin, held_from=row["id"], held_at=time.time())
+        with self._tx() as c:
+            cur = c.execute("UPDATE inbox SET state='done', done_at=? WHERE "
+                            "id=? AND state='unread'", (time.time(), row["id"]))
+            if cur.rowcount != 1:
+                return None
+            first = c.execute("INSERT OR IGNORE INTO budget_notices(channel,"
+                              "period,ts) VALUES(?,?,?)",
+                              (origin, period, time.time())).rowcount == 1
+            reply = notice if first else ""
+            c.execute("UPDATE inbox SET reply=? WHERE id=?", (reply, row["id"]))
+            copy = c.execute(
+                "INSERT INTO inbox(provider_id,received_at,channel,thread,sender,"
+                "tier,text,kind,route,meta,state) VALUES(NULL,?,?,?,?,?,?,?,"
+                "'deliver',?,'held')",
+                (row["received_at"], row["channel"], row["thread"], row["sender"],
+                 row["tier"], row["text"], row["kind"],
+                 json.dumps(meta, ensure_ascii=False))).lastrowid
+        return copy, reply
+
+    def has_held(self) -> bool:
+        with self.lock:
+            return self.conn.execute("SELECT 1 FROM inbox WHERE state='held' "
+                                     "LIMIT 1").fetchone() is not None
+
+    def release_held(self) -> int:
+        """Spend is under every cap again: held rows go back to unread."""
+        with self._tx() as c:
+            return c.execute("UPDATE inbox SET state='unread' WHERE "
+                             "state='held'").rowcount
 
     def read_by(self, turn_id: str) -> list[dict]:
         with self.lock:
@@ -490,10 +543,16 @@ class Brain:
         """Recover rows of crashed turns and keep a slow ticker that picks up
         rows written by other processes (e.g. the CLI) or left behind."""
         self.store.recover(self.prefix)
+        self.resume_held()
         if self._ticker is None:
             def loop():
                 next_reap = 0.0
                 while not self._stop.wait(tick):
+                    try:
+                        self.resume_held()
+                    except Exception as e:
+                        self.db.step("", "budget_error",
+                                     error=f"{type(e).__name__}: {e}")
                     if self.store.has_unread(self.routes):
                         self.kick()
                     if time.monotonic() >= next_reap:
@@ -588,6 +647,11 @@ class Brain:
                         return
                     if not self.store.claim_lease(self.holder, self.lease_seconds):
                         return
+                from . import budget
+                cap = budget.reached(self.cfg, self.db)
+                if cap:
+                    self._hold(row, cap)
+                    continue
                 self._turn(row)
         finally:
             hb_stop.set()
@@ -600,13 +664,67 @@ class Brain:
             if released_cleanly and self.store.has_unread(self.routes):
                 self.kick()
 
+    def resume_held(self) -> int:
+        """Held rows go back to unread once spend is under every cap."""
+        from . import budget
+        if not self.store.has_held() or budget.reached(self.cfg, self.db):
+            return 0
+        n = self.store.release_held()
+        if n:
+            self.db.step("", "budget_resumed", rows=n)
+            self.kick()
+        return n
+
+    def _hold(self, row: dict, cap: dict):
+        """A spending cap is reached: keep `row` for later (Store.hold) and
+        tell its sender once per channel per cap period."""
+        from . import budget
+        from .config import message
+        period = f"{cap['period']}:{int(cap['start'])}"
+        notice = message(self.cfg, "budget_reached",
+                         **budget.describe(self.cfg, cap))
+        held = self.store.hold(row, period, notice)
+        if held is None:
+            return
+        copy_id, reply = held
+        self.db.step("", "budget_held", channel=row["channel"], inbox_id=row["id"],
+                     held_id=copy_id, period=period, spent=round(cap["spent"], 4),
+                     limit=cap["limit"], notified=bool(reply))
+        meta = row["meta"]
+        if reply and meta.get("deliver_to"):
+            # an origin-addressed row (worker result): its route reaches the
+            # worker, not the person, so the notice goes to the origin
+            from .tools import deliver
+            status = deliver(meta["deliver_to"], reply, "budget notice",
+                             self.cfg, self.db, record=False)
+            self.db.step("", "origin_delivery", channel=meta["deliver_to"],
+                         status=status)
+            reply = ""
+        fn = self.routes.get(row["route"])
+        if fn:
+            try:
+                fn(row, reply)
+            except Exception as e:
+                self.db.step("", "route_error", channel=row["channel"],
+                             route=row["route"], error=f"{type(e).__name__}: {e}")
+        with self._changed:
+            self._changed.notify_all()
+
     def _turn(self, head: dict):
         from .loop import _run
         turn_id = f"t_{uuid.uuid4().hex[:10]}"
         self.store.mark_read([head["id"]], turn_id, self.holder)
+        text = head["text"]
+        if head["meta"].get("held_from"):
+            import datetime as _dt
+            from .budget import _zone
+            at = _dt.datetime.fromtimestamp(head["received_at"],
+                                            _zone(self.cfg))
+            text += (f"\n[held by the spending limit: received "
+                     f"{at:%Y-%m-%d %H:%M}, answered now that it reset]")
         env = {"channel": head["channel"], "thread": head["thread"],
                "sender": head["sender"], "tier": head["tier"],
-               "text": head["text"], "kind": head["kind"],
+               "text": text, "kind": head["kind"],
                "meta": head["meta"],
                "origin": head["meta"].get("deliver_to") or head["channel"]}
 

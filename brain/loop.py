@@ -64,9 +64,8 @@ def _run(env, cfg, db, client, pull=None, renew=None, turn_id=None):
     db.step(turn_id, "envelope", channel=env["channel"],
             sender=env["sender"], tier=env["tier"], text=env["text"])
 
-    if cfg["daily_budget_usd"] and db.spend_today() > cfg["daily_budget_usd"]:
-        return message(cfg, "budget_reached")
-
+    # spending caps are enforced by the dispatcher before a turn starts
+    # (inbox.Brain._hold): a message is never consumed by a refusal here
     db.add_message(env["channel"], "user", env["sender"], env["text"],
                    env["tier"])
 

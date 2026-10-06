@@ -78,8 +78,14 @@ without `--enable`. To keep the services running without a login session, run
   `memory_dir/facts.md`. A thread that outgrows `auto_compact_turns` is
   compacted automatically; for a nightly pass add
   `15 4 * * * cd ~/brain && .venv/bin/python -m brain.compact` to crontab.
-- **Budget**: once spend today exceeds `daily_budget_usd`, new turns are
-  refused. Spend is computed from the configured prices.
+- **Budget**: two caps, `daily_budget_usd` (local day, from 00:00) and
+  `weekly_budget_usd` (local week, Monday 00:00 to Monday 00:00), both in
+  `[agent] timezone`; 0 disables either. Spend is computed from the
+  configured prices. While either cap is exceeded no new turn starts (one
+  already running finishes): messages are held in the inbox, the sender gets
+  `budget_reached` once per channel per cap period, and the held messages are
+  answered in order, replies pushed to their channel, as soon as spend is
+  back under both caps (period rollover, or a raised cap and a restart).
 
 ## Message handling
 
@@ -143,16 +149,17 @@ clear message.
 | `[agent]` | `assistant_name` | `Assistant` | what the agent calls itself |
 | | `owner_name` | `Owner` | who it works for; used in prompts and tool text |
 | | `language` | `English` | default reply language (fallback identity, timers) |
-| | `timezone` | `UTC` | IANA zone for calendar events |
+| | `timezone` | `UTC` | IANA zone for calendar events and budget days/weeks |
 | | `identity_file` | `data/identity.md` | persona / system prompt |
 | | `memory_dir` | `data/memory` | `*.md` loaded into every turn (tail-capped) |
 | | `db_path` | `data/brain.db` | SQLite state |
 | `[model]` | `name` | `gpt-6-luna` | OpenAI Responses API model |
 | | `price_in_per_mtok` / `price_out_per_mtok` | `0.10` / `0.50` | USD per 1M tokens, for cost tracking |
 | | `reasoning_effort` | `medium` | passed on every model call |
-| | `daily_budget_usd` | `1.0` | spend cap per day; `0` disables it |
+| | `daily_budget_usd` | `1.0` | spend cap per local day; `0` disables it |
+| | `weekly_budget_usd` | `0.0` | spend cap per local week (Monday 00:00); `0` disables it |
 | `[limits]` | `max_tool_steps`, `window_turns`, `auto_compact_turns`, `blackboard_hours`, `blackboard_max_lines` | 6, 20, 40, 4, 12 | context and loop limits |
-| `[messages]` | `budget_reached`, `out_of_steps`, `failure` | English | fixed replies sent without a model call; write them in your language (`{owner}`, `{request}`) |
+| `[messages]` | `budget_reached`, `out_of_steps`, `failure` | English | fixed replies sent without a model call; write them in your language (`{owner}`, `{request}`; `budget_reached` also `{period}`, `{limit}`, `{spent}`, `{resets}`) |
 | `[server]` | `host` / `port` | `127.0.0.1` / `3401` | the `/turn` API (no auth: keep it on localhost) |
 | `[whatsapp]` `[comms]` `[calendar]` `[claude_sessions]` `[vault]` | `enabled` … | off | see Integrations |
 

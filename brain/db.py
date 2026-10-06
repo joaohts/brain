@@ -58,11 +58,11 @@ class DB:
              json.dumps(payload, ensure_ascii=False)))
         self.conn.commit()
 
-    def spend_today(self) -> float:
-        midnight = time.time() - (time.time() % 86400)
+    def spend_since(self, start_ts: float) -> float:
+        """Traced spend from start_ts on (brain/budget.py picks the start)."""
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(cost_usd),0) FROM steps WHERE ts>?",
-            (midnight,)).fetchone()
+            "SELECT COALESCE(SUM(cost_usd),0) FROM steps WHERE ts>=?",
+            (start_ts,)).fetchone()
         return row[0]
 
     # -- threads -----------------------------------------------------------

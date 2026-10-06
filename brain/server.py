@@ -25,7 +25,7 @@ cfg = config.load()
 db = DB(cfg["db_path"])
 brain = inbox.get(cfg, db)
 
-_STATUS = {"unread": "pending", "read_by_turn": "running"}
+_STATUS = {"unread": "pending", "held": "pending", "read_by_turn": "running"}
 
 
 def _view(row: dict | None) -> tuple[int, dict]:

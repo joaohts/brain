@@ -7,7 +7,7 @@
 assistant_name = "Assistant"        # what the agent calls itself
 owner_name = "Owner"                # the person it works for (tier "owner")
 language = "English"                # default reply language (identity_file can override)
-timezone = "UTC"                    # IANA name, used by the calendar integration
+timezone = "UTC"                    # IANA name: calendar, clock, budget days/weeks
 identity_file = "data/identity.md"  # system prompt / persona (install.sh seeds it)
 memory_dir = "data/memory"          # *.md files loaded as durable memory
 db_path = "data/brain.db"           # traces, threads, timers
@@ -17,7 +17,9 @@ name = "gpt-6-luna"                 # OpenAI Responses API model
 price_in_per_mtok = 0.10            # USD per 1M input tokens (cost tracking)
 price_out_per_mtok = 0.50           # USD per 1M output tokens
 reasoning_effort = "medium"         # none / low / medium / high, every model call
-daily_budget_usd = 1.0              # refuse new turns past this spend; 0 = no cap
+daily_budget_usd = 1.0              # hold new turns past this spend per day; 0 = no cap
+weekly_budget_usd = 0.0             # same per week (Monday 00:00); 0 = no cap
+                                    # days and weeks follow [agent] timezone
 
 [limits]
 max_tool_steps = 6
@@ -32,7 +34,7 @@ port = 3401
 
 [messages]                          # fixed replies sent without a model call;
                                     # write them in [agent] language
-budget_reached = "I've reached today's spending limit, so I can't answer until tomorrow. {owner} can raise daily_budget_usd."
+budget_reached = "I've reached my {period} spending limit (US$ {limit}). Your messages are saved and I'll answer them when it resets ({resets}). {owner} can raise daily_budget_usd or weekly_budget_usd."
 out_of_steps = "I ran out of steps before finishing this: {request}"
 failure = "Something failed on my side before I could answer: {request}"
 

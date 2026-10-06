@@ -36,7 +36,8 @@ DEFAULTS = {
     "price_in_per_mtok": 0.10,    # USD per 1M input tokens
     "price_out_per_mtok": 0.50,   # USD per 1M output tokens
     "reasoning_effort": "medium",
-    "daily_budget_usd": 1.0,      # 0 disables the cap
+    "daily_budget_usd": 1.0,      # 0 disables the cap; local midnight
+    "weekly_budget_usd": 0.0,     # 0 disables the cap; Monday 00:00 local
     # [limits]
     "max_tool_steps": 6,
     "window_turns": 20,           # tool-trace rows share the window with real turns
@@ -95,8 +96,10 @@ INTEGRATIONS = {
 
 # Fixed replies sent without a model call. Write them in [agent] language.
 MESSAGES = {
-    "budget_reached": "I've reached today's spending limit, so I can't answer "
-                      "until tomorrow. {owner} can raise daily_budget_usd.",
+    "budget_reached": "I've reached my {period} spending limit (US$ {limit}). "
+                      "Your messages are saved and I'll answer them when it "
+                      "resets ({resets}). {owner} can raise daily_budget_usd "
+                      "or weekly_budget_usd.",
     "out_of_steps": "I ran out of steps before finishing this: {request}",
     "failure": "Something failed on my side before I could answer: {request}",
 }
@@ -158,10 +161,14 @@ def load(path=None) -> dict:
 
 
 def message(cfg, key: str, **values) -> str:
-    """A configured fixed reply with {owner}/{request} filled in."""
+    """A configured fixed reply with {owner}/{request} (budget_reached also
+    {period}/{limit}/{spent}/{resets}) filled in; a placeholder the caller
+    has no value for is left empty."""
+    class Blank(dict):
+        def __missing__(self, k):
+            return ""
     values.setdefault("owner", cfg["owner_name"])
-    values.setdefault("request", "")
-    return cfg["messages"][key].format(**values)
+    return cfg["messages"][key].format_map(Blank(values))
 
 
 def enabled(cfg, name: str) -> bool:
@@ -174,6 +181,9 @@ def validate(cfg) -> None:
     if not 0 < cfg["window_turns"] < cfg["auto_compact_turns"]:
         raise ConfigError("[limits] window_turns must be > 0 and smaller than "
                           "auto_compact_turns (otherwise every turn compacts)")
+    for k in ("daily_budget_usd", "weekly_budget_usd"):
+        if not isinstance(cfg[k], (int, float)) or cfg[k] < 0:
+            raise ConfigError(f"[model] {k} must be a number >= 0 (0 = no cap)")
     if enabled(cfg, "whatsapp"):
         f = cfg["whatsapp"]["contacts_file"]
         if not os.path.isfile(f):
