@@ -295,12 +295,13 @@ is still there; its terminal or tmux session is left alone. A managed tmux
 session whose claude has exited is ended `idle_minutes` after the brain
 first sees it so.
 
-Claude reads hooks at startup, so sessions already running when the hook is
-installed fire none. For those, the brain uses their transcript writes and
+Running sessions pick the hook up too (seen with Claude Code 2.1.291: an
+active and an idle session started logging soon after `install`). A session
+that has not fired a hook yet is judged by its transcript writes and
 Claude's own status file (`~/.claude/sessions/<pid>.json`; `busy` counts as
-a tool in flight), and their clock starts no earlier than when it first saw
-them. Installing the hook never ends a session sooner than `idle_minutes`
-later.
+a tool in flight), and its clock starts no earlier than when the brain
+first saw it, so installing the hook never ends a session sooner than
+`idle_minutes` later.
 
 Not covered: a background command or subagent that runs on after the turn
 ended and fires no hook for 8 hours (its completion would be activity); and

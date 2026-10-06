@@ -13,11 +13,12 @@ A tool whose PreToolUse has no PostToolUse yet is in flight: the session is
 busy, not idle, however long the tool runs, up to TOOL_CAP (then it is taken
 for hung).
 
-Sessions that started before the hook was registered fire no hooks (Claude
-reads hooks at startup). They are "legacy": their activity is the
-transcript's mtime and Claude's own status file (~/.claude/sessions/<pid>.json,
-status busy counts like a tool in flight), and the clock never starts before
-the reaper first saw them, so the migration itself never ends one.
+A session that has fired no hook yet (it predates the hook and has been
+idle since; running sessions do pick it up) is "legacy": its activity is
+the transcript's mtime and Claude's own status file
+(~/.claude/sessions/<pid>.json, status busy counts like a tool in flight),
+and the clock never starts before the reaper first saw it, so the
+migration itself never ends one.
 """
 
 from __future__ import annotations
