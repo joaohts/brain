@@ -1,7 +1,9 @@
 """The agent loop: envelope in → context → model+tools → reply out.
 
 Globally serialized (one turn at a time) by design — race-free memory,
-coherent blackboard. Every step traced to SQLite."""
+coherent blackboard. Every step traced to SQLite. Turns are started by the
+inbox dispatcher (brain/inbox.py); before each model step the running turn
+merges new messages from the same sender and thread."""
 
 import glob
 import json
@@ -15,13 +17,7 @@ from openai import OpenAI
 from . import tools
 from .config import api_key
 from .db import DB
-
-# One global lock: one turn at a time, one train of thought (by design).
-# Turns may take as long as the model needs. Client robustness lives in the
-# HTTP layer instead: submit-and-poll, so no caller ever holds a socket open
-# waiting minutes for the lock.
-_lock = threading.Lock()
-
+from .inbox import MAX_DRAFT_DISCARDS
 
 def _identity(cfg) -> str:
     try:
@@ -51,26 +47,35 @@ def _cost(cfg, usage) -> float:
 
 def run_turn(envelope: dict, cfg: dict, db: DB, client: OpenAI | None = None,
              on_start=None) -> str:
-    """envelope: {channel, sender, tier: owner|family|unknown, text}
+    """envelope: {channel, sender, tier, text[, thread, provider_id]}
 
-    on_start fires the moment the lock is acquired — i.e. when the turn stops
-    queuing and actually begins (used for typing indicators)."""
-    with _lock:
-        if on_start:
-            try:
-                on_start()
-            except Exception:
-                pass
-        # generous per-call ceiling: the model may legitimately think for
-        # minutes on a step; this only catches truly hung connections
-        client = client or OpenAI(api_key=api_key(),
-                                  timeout=600.0, max_retries=1)
-        return _run(envelope, cfg, db, client)
+    Writes the envelope to the inbox and blocks until a turn has answered it
+    (one turn at a time, globally). For callers that block anyway: the CLI,
+    `"wait": true` HTTP requests. on_start is accepted for compatibility;
+    pollers see the row's state instead."""
+    from . import inbox
+    brain = inbox.get(cfg, db,
+                      client_factory=(lambda: client) if client else None)
+    return brain.run_sync(envelope)
 
 
-def _run(env, cfg, db, client):
-    turn_id = f"t_{uuid.uuid4().hex[:10]}"
+def _merge(rows, env, db, turns_input):
+    """Append merged inbox rows as user messages, each with its own stamp."""
+    from .inbox import stamp
+    for r in rows:
+        text = stamp(r)
+        turns_input.append({"role": "user", "content": text})
+        db.add_message(env["channel"], "user", r["sender"], r["text"])
+        db.step(env["turn_id"], "merged", channel=env["channel"],
+                inbox_id=r["id"], sender=r["sender"], tier=r["tier"],
+                kind=r["kind"])
+
+
+def _run(env, cfg, db, client, pull=None, renew=None, turn_id=None):
+    turn_id = turn_id or f"t_{uuid.uuid4().hex[:10]}"
     env = dict(env, turn_id=turn_id)
+    pull = pull or (lambda: [])
+    renew = renew or (lambda: None)
     t0 = time.time()
     db.step(turn_id, "envelope", channel=env["channel"],
             sender=env["sender"], tier=env["tier"], text=env["text"])
@@ -133,8 +138,8 @@ def _run(env, cfg, db, client):
                   "there with send_to — this comes before everything. "
                   "Step 2: reply here with instructions or questions when "
                   "you have them; NO_REPLY is valid only once step 1 is "
-                  "done. A session delivering its FINAL result is reaped "
-                  "with claude_kill after routing. NACKs and delivery "
+                  "done. Finished workers are reaped automatically. "
+                  "NACKs and delivery "
                   "errors are INTERNAL signals: never announce, speak, or "
                   "relay them on any human channel — act on "
                   "them (start the task properly with claude_spawn, or tell "
@@ -157,7 +162,9 @@ def _run(env, cfg, db, client):
 
     schema = tools.schema_for(env["tier"], cfg)
     final = ""
-    for _ in range(cfg["max_tool_steps"]):
+    steps, budget, discards = 0, cfg["max_tool_steps"], 0
+    while steps < budget:
+        renew()
         t_model = time.time()
         resp = client.responses.create(
             model=cfg["model"], instructions=system, input=turns_input,
@@ -170,9 +177,23 @@ def _run(env, cfg, db, client):
                 cost_usd=_cost(cfg, u), status=resp.status,
                 reasoning_effort=cfg["reasoning_effort"],
                 reasoning_tokens=reasoning_tokens(u))
+        steps += 1
         calls = [it for it in resp.output if it.type == "function_call"]
         if not calls:
-            final = resp.output_text or ""
+            draft = resp.output_text or ""
+            late = pull()
+            if late and discards < MAX_DRAFT_DISCARDS:
+                # the speaker added something while we were writing: drop the
+                # draft and take one more step with the new message in view
+                discards += 1
+                db.step(turn_id, "draft_discarded", channel=env["channel"],
+                        merged=len(late), draft=draft[:500])
+                _merge(late, env, db, turns_input)
+                budget = max(budget, steps + 1)
+                continue
+            if late:
+                _merge(late, env, db, turns_input)  # answered by this reply
+            final = draft
             break
         turns_input += [it for it in resp.output]
         for fc in calls:
@@ -190,6 +211,7 @@ def _run(env, cfg, db, client):
             db.add_message(env["channel"], "tool", f"tool:{fc.name}",
                            f"{fc.name}({in_crop}) -> "
                            f"{result[:240]} [turn {turn_id}]")
+        _merge(pull(), env, db, turns_input)   # step boundary
 
     if not final.strip():
         final = "Something went wrong on my side just now — could you say that again?"

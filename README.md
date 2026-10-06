@@ -54,9 +54,11 @@ without `--enable`. To keep the services running without a login session, run
 
 - **Envelope**: every inbound message is `{channel, sender, tier, text}`.
   `channel` is the thread key (`wpp:alice`, `comms-v1:<machine>:<agent>`,
-  `cli`) and `tier` is `owner`, `family` or `unknown`.
-- **Loop** (`brain/loop.py`): one global lock means one turn at a time. Each
-  turn builds context from the identity file, memory files, the channel's
+  `cli`) and `tier` is `owner`, `family` or `unknown` (plus `agent`, which the
+  runtime assigns to results from workers the brain spawned).
+- **Inbox → loop** (`brain/inbox.py`, `brain/loop.py`): every envelope is
+  written to the inbox first, and turns answer inbox rows one at a time (see
+  [Message handling](#message-handling)). Each turn builds context from the identity file, memory files, the channel's
   rolling summary and recent window, plus a one-line "blackboard" of the
   other active channels. It then calls the model and runs tool calls, up to
   `max_tool_steps`.
@@ -71,6 +73,48 @@ without `--enable`. To keep the services running without a login session, run
   `15 4 * * * cd ~/brain && .venv/bin/python -m brain.compact` to crontab.
 - **Budget**: once spend today exceeds `daily_budget_usd`, new turns are
   refused. Spend is computed from the configured prices.
+
+## Message handling
+
+No message waits blind or gets lost, and every message is answered at its
+sender's own tier.
+
+- **Inbox first.** Every inbound message is stored in the `inbox` table of
+  `data/brain.db` before anything else happens: WhatsApp, comms, CLI, HTTP
+  `/turn`, timers and worker results alike. Each row records sender, tier,
+  channel, thread, `provider_id` and state (`unread` → `read_by_turn` →
+  `done`). `provider_id` is unique, so a redelivered WhatsApp or comms message
+  is dropped instead of answered twice. The turn lock only decides who
+  answers next; it never decides whether something is answered.
+- **One turn at a time, under a lease.** A turn holds a lease that is renewed
+  every model step and by a heartbeat. If a process dies mid-turn, the lease
+  expires and the next claim takes it over, and the dead turn's messages go
+  back to `unread`. A running turn is never cancelled.
+- **Follow-ups merge at step boundaries.** Before each model step, the running
+  turn picks up unread messages from the same sender in the same channel and
+  thread, plus worker results for that thread. They are appended after the
+  tool results, each stamped with its own sender, tier and channel; at most 20
+  messages or about 4,000 characters per read, and the rest wait for the next
+  step. If the model had already written its final answer, that draft is
+  discarded and it takes one more step. A merged message completes with an
+  empty reply, because the turn's own reply covers it.
+- **Different senders are never merged.** Someone else writing to the same
+  chat, or a peer agent, gets a turn of their own after the current one, at
+  their own tier.
+- **Handoff.** When a turn ends, the oldest unread message starts the next turn
+  straight away, without releasing the lease. With nothing unread, the lease is
+  released and the inbox is checked once more, so a message that arrives in
+  that gap isn't stranded.
+- **Delegation is asynchronous.** `claude_spawn` returns immediately and
+  records which conversation asked for the work. The worker's reports arrive
+  later as inbox rows addressed to that origin conversation at tier `agent`.
+  That tier is never `owner`, even on a trusted machine; it can only use
+  `send_to` toward its origin. The reply to a worker report is delivered to
+  the origin channel. If the origin's own turn is running, the report is
+  merged into it; otherwise it starts a turn there. A worker whose report
+  starts with `[FINAL]` is reaped once that report has reached the origin.
+  When a spawn fails, a `spawn FAILED: …` note lands in the origin
+  conversation so the requester is told.
 
 ## Configuration
 
@@ -149,13 +193,15 @@ local comms node over its unix socket. To turn it on:
 1. Install the comms node on this host and pair it with your other machines
    (see the [comms](https://github.com/joaohts/comms) README).
 2. In `config.toml`, set `[comms] enabled = true` and list
-   `trusted_machines`. Agents on those machines get tier `owner`; everyone
-   else gets `unknown`.
+   `trusted_machines`. Agents on those machines get tier `owner`, except
+   workers the brain spawned, which get `agent`; everyone else gets
+   `unknown`.
 3. Restart: `systemctl --user restart brain`.
 
 The brain attaches a persistent identity (`alias`, default `brain`). Inbound
-messages are journaled durably in `state_path`, run as turns on channel
-`comms-v1:<machine>:<agent>`, and answered back to that exact agent. A reply
+messages are journaled durably in `state_path`, written to the inbox, answered
+in turns on channel `comms-v1:<machine>:<agent>`, and replied to that exact
+agent. A reply
 starting with `NO_REPLY` is suppressed, which breaks agent-to-agent ack loops.
 Peer text reaches the model as quoted data, not as instructions.
 
@@ -163,8 +209,9 @@ Peer text reaches the model as quoted data, not as instructions.
 
 The `claude_spawn` / `claude_list` / `claude_kill` tools (owner tier) start
 managed Claude Code sessions in tmux through `scripts/claude-sessions.sh`.
-Each session joins comms, receives its task from the brain and reports back on
-its comms channel. This requires `[comms]`, `tmux`, `claude`, the `comms` CLI
+Each session joins comms, receives its task from the brain, and reports back.
+Its reports are routed to the conversation that asked for the work (see
+[Message handling](#message-handling)). This requires `[comms]`, `tmux`, `claude`, the `comms` CLI
 and its `/open-comms` skill. If a spawn can't come up (login expired, claude
 exited, no comms receiver), the tool returns `spawn FAILED: …` quickly instead
 of promising a follow-up.
@@ -207,9 +254,13 @@ There's no plugin registry. A channel needs three small pieces:
    - Out of process (preferred, no brain changes): `POST /turn` with
      `{channel, sender, tier, text}` returns `{"id"}`, then poll
      `GET /turn/<id>` until `status` is `done` (`reply`) or `error`. Add
-     `"wait": true` to block instead, for quick scripts.
-   - In process: call `brain.loop.run_turn(envelope, cfg, db)` from your own
-     thread, as `brain/comms_v1.py` does.
+     `"wait": true` to block instead, for quick scripts. Pass your platform's
+     message id as `provider_id` so redeliveries are dropped, and an optional
+     `thread` to keep conversations in one chat apart. A `done` with an empty
+     `reply` means the message was merged into a turn that already answered.
+   - In process: `brain.inbox.current().submit(envelope, route=...)` with a
+     route callback for the reply, as `brain/comms_v1.py` does, or
+     `brain.loop.run_turn(envelope, cfg, db)` to block until answered.
 2. **Identity**: choose a stable `channel` key per person or peer
    (`<prefix>:<id>`) and resolve `tier` from your own allowlist. Never let
    message content choose its own tier.
