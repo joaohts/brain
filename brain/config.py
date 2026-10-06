@@ -56,6 +56,7 @@ INTEGRATIONS = {
         "transcribe_model": "whisper-1",
         "vision_model": "gpt-5-mini",
         "transcribe_language": "",
+        "owner_channel": "cli",
     },
     "comms": {
         "enabled": False,
@@ -139,6 +140,13 @@ def validate(cfg) -> None:
         if not os.path.isfile(f):
             raise ConfigError(f"whatsapp: contacts_file not found: {f} "
                               f"(copy wa/allow.example.json)")
+        oc = str(cfg["whatsapp"]["owner_channel"])
+        # logout notices can't go over the channel that just logged out
+        if not (oc == "cli" or oc.startswith(("comms-v1:", "comms:"))):
+            raise ConfigError(f"whatsapp: owner_channel must be 'cli' or a "
+                              f"comms-v1:/comms: channel, got {oc!r}")
+        if oc.startswith(("comms-v1:", "comms:")) and not enabled(cfg, "comms"):
+            raise ConfigError(f"whatsapp: owner_channel {oc!r} needs [comms] enabled")
     if enabled(cfg, "comms"):
         c = cfg["comms"]
         if not isinstance(c["trusted_machines"], list) or any(
@@ -179,6 +187,7 @@ def _shell(cfg, name: str) -> str:
              "WA_VISION_MODEL": w["vision_model"],
              "WA_TRANSCRIBE_LANGUAGE": w["transcribe_language"],
              "WA_LANGUAGE": cfg["language"],
+             "WA_OWNER_CHANNEL": w["owner_channel"],
              "BRAIN_URL": f"http://{cfg['host']}:{cfg['http_port']}"}
     return "\n".join(f"export {k}={shlex.quote(str(v))}" for k, v in pairs.items())
 

@@ -576,6 +576,82 @@ def t_calendar_confirm(env, args, cfg, db):
     return out if ok else f"execution failed: {out}"
 
 
+# -- WhatsApp re-pairing --------------------------------------------------------
+# The sidecar serves its pairing state on localhost (GET /status, GET /qr,
+# POST /repair). whatsapp_pair restarts pairing and relays each new QR to the
+# channel that asked — never over WhatsApp, which is the thing being repaired.
+WA_PAIR_TIMEOUT = 180  # s; QR codes rotate about every 20 s
+WA_PAIR_POLL = 3       # s
+
+
+def _wa_http(cfg, method: str, path: str, timeout: float = 10):
+    """(status, json body) from the sidecar; (0, {"error": ...}) when unreachable."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{cfg['whatsapp']['port']}{path}", method=method,
+        data=b"" if method == "POST" else None)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, _json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, _json.loads(e.read() or b"{}")
+        except ValueError:
+            return e.code, {}
+    except Exception as e:
+        return 0, {"error": f"{type(e).__name__}: {e}"}
+
+
+# injectable for tests: HTTP to the sidecar, sleeping, and the clock
+_wa = {"http": _wa_http, "sleep": time.sleep, "clock": time.monotonic}
+
+
+def t_whatsapp_pair(env, args, cfg, db):
+    channel = env["channel"]
+    if channel.startswith("wpp:"):
+        return ("refused: pairing QR codes are never sent over WhatsApp. Ask for "
+                "pairing from the CLI or a comms session.")
+    http, sleep, clock = _wa["http"], _wa["sleep"], _wa["clock"]
+    status, body = http(cfg, "POST", "/repair")
+    if status != 200:
+        return (f"whatsapp pairing FAILED: sidecar /repair returned {status} "
+                f"{body.get('error', '')}. Is the brain-wa service running?").strip()
+    db.step(env["turn_id"], "whatsapp_repair", channel=channel,
+            sender=env["sender"], moved_to=body.get("moved_to"))
+    deadline = clock() + WA_PAIR_TIMEOUT
+    last_qr, sent = None, 0
+    while clock() < deadline:
+        status, st = http(cfg, "GET", "/status")
+        if status == 200 and st.get("connected"):
+            db.step(env["turn_id"], "whatsapp_paired", channel=channel,
+                    jid=st.get("jid"), qr_sent=sent)
+            return f"connected as {st.get('jid')}"
+        status, q = http(cfg, "GET", "/qr")
+        if status == 200 and q.get("qr") and q["qr"] != last_qr:
+            last_qr = q["qr"]
+            sent += 1
+            out = deliver(channel,
+                          f"WhatsApp QR #{sent}: on the phone open WhatsApp > "
+                          f"Linked devices > Link a device and scan it (it "
+                          f"rotates in ~20 s; a new one follows):\n"
+                          f"{q.get('text') or q['qr']}",
+                          "whatsapp_pair", cfg, db)
+            if out.startswith("unknown or disabled channel"):
+                return (f"whatsapp pairing FAILED: can't deliver QR codes to "
+                        f"{channel}. Ask from the CLI or a comms session.")
+            if channel == "cli":
+                # cli deliveries are only recorded; show it on the terminal
+                # (python -m brain.cli) or in data/brain.log (service)
+                print(f"[whatsapp_pair] QR #{sent}:\n{q.get('text') or q['qr']}",
+                      flush=True)
+        sleep(WA_PAIR_POLL)
+    db.step(env["turn_id"], "whatsapp_pair_timeout", channel=channel, qr_sent=sent)
+    return (f"timed out after {WA_PAIR_TIMEOUT} s without a scan ({sent} QR "
+            f"codes sent). Ask again to retry.")
+
+
 TOOLS = [
     dict(name="remember", ring=2, fn=t_remember,
          description="Saves an important fact to durable memory.",
@@ -655,6 +731,14 @@ TOOLS = [
          description="Kills a managed Claude Code session by id.",
          parameters={"type": "object", "properties": {
              "session_id": {"type": "string"}}, "required": ["session_id"]}),
+    dict(name="whatsapp_pair", ring=2, fn=t_whatsapp_pair, requires="whatsapp",
+         description="Re-pairs the WhatsApp link when it is logged out or "
+                      "broken: moves the old session aside, then sends each "
+                      "new QR code to THIS conversation for {owner} to scan, "
+                      "for up to 3 minutes. Reports 'connected as <id>' or "
+                      "'timed out'. Works from the CLI or comms, not from "
+                      "WhatsApp itself.",
+         parameters={"type": "object", "properties": {}}),
     dict(name="calendar_read", ring=0, fn=t_calendar_read, requires="calendar",
          description="Reads {owner}'s real calendar (all calendars "
                       "merged, timezone {tz}). Returns JSON "

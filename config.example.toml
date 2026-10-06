@@ -40,6 +40,8 @@ auth_dir = "wa/auth"                # Baileys session; created on first QR scan
 transcribe_model = "whisper-1"      # voice notes -> text
 vision_model = "gpt-5-mini"         # images / PDFs -> text (in [agent] language)
 transcribe_language = ""            # ISO-639-1 hint for voice notes, e.g. "en"; "" = auto
+owner_channel = "cli"               # where "WhatsApp logged out" notices go: "cli" or a
+                                    # comms-v1:<machine>:<agent> channel (needs [comms])
 
 [comms]                             # comms node channel (brain/comms_v1.py)
 enabled = false

@@ -177,13 +177,33 @@ runs and none of its tools are offered to the model.
      device*. QR codes rotate about every 20 s.
   4. A disconnect with code **515** right after the scan is normal (restart
      required). The sidecar reconnects on its own.
-  5. If the log says **LOGGED OUT**: stop `brain-wa`, move `wa/auth` aside (for
-     example `mv wa/auth wa/auth.old-$(date +%s)`), start it again and scan a
-     new QR.
+  5. If WhatsApp logs the device out, see *Re-pairing* below.
 
   Use the QR flow. Baileys' phone-number *pairing-code* flow returned 400 for
   us, and retrying it got the number soft-blocked (428), so this repo doesn't
   automate it.
+- **Re-pairing through the brain**: on a logout (401) the sidecar stays up and
+  asks the brain to tell the owner on `owner_channel` ("WhatsApp logged out —
+  ask me to pair"). `owner_channel` is `cli` (default) or a
+  `comms-v1:<machine>:<agent>` channel; it can't be WhatsApp itself. To
+  re-pair:
+  1. Remove the old linked device on the phone first, as in step 1 above.
+  2. From the CLI or a comms session (never from WhatsApp), ask the brain to
+     pair WhatsApp. Its `whatsapp_pair` tool is owner tier only; other tiers
+     don't see it and are refused and logged if they try.
+  3. The tool calls the sidecar's `POST /repair`. That moves `wa/auth` aside as
+     `wa/auth.old-<timestamp>` (it never deletes it) and starts a fresh
+     session.
+  4. For up to 3 minutes the tool sends each new QR, as UTF-8 block text, to
+     the conversation that asked. Scan it from *Linked devices → Link a
+     device*. On the CLI the QR also prints to the terminal and
+     `data/brain.log`.
+  5. It ends with `connected as <jid>` or `timed out` (just ask again).
+
+  The tool holds the turn while it waits, so other channels queue for up to
+  3 minutes. The sidecar's local endpoints, bound to `127.0.0.1` only:
+  `GET /status` → `{connected, jid, loggedOut}`, `GET /qr` → `{qr, text}`
+  (404 when paired), `POST /repair`, and `POST /send`.
 
 ### comms (`[comms]`)
 
@@ -284,7 +304,7 @@ wa/               WhatsApp sidecar (Node, Baileys)
 scripts/          claude-sessions.sh (tmux-managed Claude Code sessions)
 deploy/systemd/   unit templates rendered by install.sh
 examples/         identity.example.md
-tests/            python -m unittest discover tests
+tests/            python -m unittest discover tests  (sidecar: node --test wa/)
 config.example.toml  .env.example  install.sh  run-brain.sh  run-wa.sh
 data/             created at runtime: db, memory, identity, logs (git-ignored)
 ```

@@ -25,6 +25,7 @@ import fs from 'fs';
 import http from 'http';
 import pino from 'pino';
 import qrterm from 'qrcode-terminal';
+import { moveAuthAside } from './auth.js';
 
 const OPENAI_KEY = (() => {
   try {
@@ -41,6 +42,7 @@ const MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 const BRAIN = process.env.BRAIN_URL || 'http://127.0.0.1:3401';
 const PORT = Number(process.env.WA_PORT || 3402);
 const AUTH_DIR = process.env.WA_AUTH || './auth';
+const OWNER_CHANNEL = process.env.WA_OWNER_CHANNEL || 'cli';   // logout notices
 const DEBOUNCE_MS = 2000;
 const POLL_MS = 2000, POLL_MAX_MS = 10 * 60 * 1000;
 
@@ -61,6 +63,16 @@ const balog = pino({ level: process.env.WA_LOG_LEVEL || 'info' },
     || new URL('../data/wa-baileys.log', import.meta.url).pathname, sync: false, mkdir: true }));
 let selfJid = null;
 let sock = null;
+
+// -- pairing state (served on GET /qr and GET /status, localhost only) -------
+const pairing = { qr: null, qrText: null, connected: false, jid: null, loggedOut: false };
+let generation = 0;              // bumps on /repair; stale sockets' events are ignored
+
+function renderQr(qr) {
+  let text = null;
+  qrterm.generate(qr, { small: true }, (s) => { text = s; });   // synchronous
+  return text;
+}
 
 // -- brain bridge -------------------------------------------------------------
 async function brainTurn(envelope, chatJid) {
@@ -100,12 +112,13 @@ async function brainTurn(envelope, chatJid) {
 // -- inbound: debounce per chat ----------------------------------------------
 const buffers = new Map();       // chatJid -> {texts, timer, sender, tier}
 
-function enqueue(chatJid, who, text) {
+function enqueue(chatJid, who, text, msgId) {
   const buf = buffers.get(chatJid) || {
-    texts: [], timer: null, t0: Date.now(),
+    texts: [], ids: [], timer: null, t0: Date.now(),
     sender: who.name, tier: who.tier, alias: who.alias,
   };
   buf.texts.push(text);
+  if (msgId) buf.ids.push(msgId);
   clearTimeout(buf.timer);
   buf.timer = setTimeout(() => flush(chatJid), DEBOUNCE_MS);
   buffers.set(chatJid, buf);
@@ -121,6 +134,8 @@ async function flush(chatJid) {
     // one channel per PERSON, alias-keyed; numbers stay in allow.json
     channel: `wpp:${buf.alias}`,
     sender: buf.sender, tier: buf.tier, text,
+    // WhatsApp message id(s) of this debounced batch, for brain-side dedup
+    provider_id: buf.ids.length ? `wa:${buf.ids.join(',')}` : undefined,
   }, chatJid);
   if (reply) {
     try { await send(resolveJid(chatJid), reply); }
@@ -203,6 +218,7 @@ async function send(jid, text) {
 
 // -- whatsapp connection -------------------------------------------------------
 async function connect() {
+  const gen = generation;
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
   sock = makeWASocket({
@@ -218,20 +234,30 @@ async function connect() {
   });
   sock.ev.on('creds.update', saveCreds);
 
+  const me = sock;
   sock.ev.on('connection.update', (u) => {
-    if (u.qr) { log('QR needed — scan below:'); qrterm.generate(u.qr, { small: true }); }
+    if (gen !== generation) return;             // superseded by /repair
+    if (u.qr) {
+      pairing.qr = u.qr;
+      pairing.qrText = renderQr(u.qr);
+      log('QR needed — scan below (also served on GET /qr):\n' + pairing.qrText);
+    }
     if (u.connection === 'open') {
-      selfJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-      log(`connected as ${sock.user.id}; `
+      selfJid = me.user.id.split(':')[0] + '@s.whatsapp.net';
+      Object.assign(pairing, { qr: null, qrText: null, connected: true,
+                               jid: me.user.id, loggedOut: false });
+      log(`connected as ${me.user.id}; `
           + `channels: ${Object.keys(ALLOW_FROM).length} allowlisted`);
     }
     if (u.connection === 'close') {
       const code = u.lastDisconnect?.error?.output?.statusCode;
+      pairing.connected = false;
       log('connection closed, code', code);
       // 515 (restartRequired) right after a QR scan is normal: reconnect.
-      if (code !== DisconnectReason.loggedOut) setTimeout(connect, 3000);
-      else log(`LOGGED OUT — stop the service, move ${AUTH_DIR} aside, `
-               + 'restart and scan the new QR');
+      if (code !== DisconnectReason.loggedOut) setTimeout(() => {
+        if (gen === generation) connect();
+      }, 3000);
+      else onLoggedOut();
     }
   });
 
@@ -247,7 +273,7 @@ async function connect() {
         || m.message?.extendedTextMessage?.text || '';
       if (text) {
         sock.readMessages([m.key]).catch(e => log('readMessages failed:', e));
-        enqueue(jid, who, text);
+        enqueue(jid, who, text, m.key.id);
         continue;
       }
       const kind = m.message?.audioMessage ? 'audio'
@@ -258,7 +284,7 @@ async function connect() {
       (async () => {   // download + model call take seconds; keep upsert loop hot
         try {
           const t = await mediaText(m);
-          if (t) { log(`[media] ${kind}: ${t.slice(0, 80)}`); enqueue(jid, who, t); }
+          if (t) { log(`[media] ${kind}: ${t.slice(0, 80)}`); enqueue(jid, who, t, m.key.id); }
         } catch (e) { log(`[media] ${kind} failed:`, e); }
       })();
     }
@@ -278,7 +304,59 @@ function resolveJid(to) {
   return lid[0];
 }
 
+// -- logout + re-pairing -------------------------------------------------------
+// On logout the sidecar stays up: it tells the brain (which tells the owner on
+// WA_OWNER_CHANNEL) and waits for POST /repair, normally sent by the brain's
+// owner-only whatsapp_pair tool.
+async function onLoggedOut() {
+  Object.assign(pairing, { connected: false, jid: null, qr: null, qrText: null,
+                           loggedOut: true });
+  selfJid = null;
+  log(`LOGGED OUT — waiting for POST /repair (the brain's whatsapp_pair tool); `
+      + `${AUTH_DIR} is moved aside then, never deleted`);
+  try {
+    await fetch(`${BRAIN}/turn`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel: 'system', sender: 'whatsapp sidecar', tier: 'owner',
+        text: `[WHATSAPP LOGGED OUT] Use send_to on channel ${OWNER_CHANNEL} `
+            + 'to tell the owner exactly: "WhatsApp logged out — ask me to pair".',
+      }),
+    });
+  } catch (e) { log('logout notice to brain failed:', e.message); }
+}
+
+async function repair() {
+  generation++;                                   // silence the old socket
+  try { sock?.end?.(new Error('repair requested')); } catch {}
+  const moved = moveAuthAside(AUTH_DIR);
+  log(`[repair] ${moved ? `moved ${AUTH_DIR} -> ${moved}` : 'no auth dir to move'}; `
+      + 'starting a fresh session (QRs follow)');
+  Object.assign(pairing, { qr: null, qrText: null, connected: false, jid: null,
+                           loggedOut: false });
+  selfJid = null;
+  connect().catch(e => log('[repair] connect failed:', e));
+  return moved;
+}
+
+function json(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+
 http.createServer(async (req, res) => {
+  if (req.method === 'GET' && req.url === '/status') {
+    return json(res, 200, { connected: pairing.connected, jid: pairing.jid,
+                            loggedOut: pairing.loggedOut });
+  }
+  if (req.method === 'GET' && req.url === '/qr') {
+    if (pairing.connected || !pairing.qr) return json(res, 404, { error: 'no QR (paired or not ready)' });
+    return json(res, 200, { qr: pairing.qr, text: pairing.qrText });
+  }
+  if (req.method === 'POST' && req.url === '/repair') {
+    try { return json(res, 200, { ok: true, moved_to: await repair() }); }
+    catch (e) { return json(res, 500, { error: String(e) }); }
+  }
   if (req.method !== 'POST' || req.url !== '/send') { res.writeHead(404); return res.end(); }
   let body = '';
   req.on('data', c => body += c);
@@ -295,6 +373,7 @@ http.createServer(async (req, res) => {
       res.writeHead(500); res.end(JSON.stringify({ error: String(e) }));
     }
   });
-}).listen(PORT, '127.0.0.1', () => log(`send endpoint on :${PORT}`));
+}).listen(PORT, '127.0.0.1', () => log(`endpoints on 127.0.0.1:${PORT}: `
+  + 'POST /send, GET /status, GET /qr, POST /repair'));
 
 connect();
