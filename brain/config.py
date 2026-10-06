@@ -77,7 +77,8 @@ INTEGRATIONS = {
         "script": "scripts/claude-sessions.sh",
         "source": "brain",
         "idle_minutes": 480,    # reap a worker after this long inactive; 0 = reap at [FINAL]
-        "reap_other_managed": False,  # same inactivity rule for other sources' sessions
+        "reap_scope": "brain",  # whose sessions time out: brain | managed | all
+        "state_dir": "~/.local/state/claude-sessions",  # activity logs (hook)
     },
     "vault": {
         "enabled": False,

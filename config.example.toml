@@ -67,9 +67,11 @@ source = "brain"                    # session-name prefix
 idle_minutes = 480                  # a worker inactive this long (no pane output, report
                                     # or follow-up) is killed, [FINAL] or not; 0 = kill
                                     # at [FINAL] (480 still applies to the rest)
-reap_other_managed = false          # true: every other session claude-sessions.sh made
-                                    # (any source) is killed after idle_minutes (480 if 0)
-                                    # with no pane output; unstamped tmux is never touched
+reap_scope = "brain"                # whose idle Claude sessions are ended: "brain" (ours),
+                                    # "managed" (any claude-sessions.sh one), "all" (every
+                                    # claude process; others get SIGTERM, terminal kept)
+state_dir = "~/.local/state/claude-sessions"   # activity logs written by
+                                    # scripts/claude-activity-hook.sh (install it!)
 
 [vault]                             # vault_* tools: owner-only notes folder access
 enabled = false

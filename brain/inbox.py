@@ -698,60 +698,129 @@ class Brain:
         if sid:
             self.store.worker_progress(sid)
 
-    def reap_idle(self, now: float | None = None):
-        """Reap every session we spawned that has been inactive for
-        idle_minutes, whatever its state. The last pane output of each
-        session (tmux window_activity) counts as activity; looking at it does
-        not. Sessions of ours the table doesn't track as live (spawned before
-        it existed, or a kill that didn't take) are held to the same rule.
-        If the panes can't be read, nothing is reaped."""
-        from . import tools
-        now = time.time() if now is None else now
-        panes = tools.pane_activity(self.cfg)
-        if panes is None:
-            return
-        for sid, at in panes.items():
-            self.store.touch_worker(sid, at)
-        cutoff = now - self.idle_seconds()
-        reaped = set()
-        for sid in self.store.inactive(cutoff):
-            if self.store.claim_reap(sid, cutoff):
-                reaped.add(sid)
-                self._killed(self.store.worker(sid), "", reason="inactive")
-        live = set(self.store.live_workers()) | reaped
-        for sid, at in panes.items():
-            if sid not in live and at <= cutoff:
-                self.db.step("", "worker_reaped", channel="", session=sid,
-                             reason="inactive, untracked")
-                threading.Thread(target=tools.kill_session,
-                                 args=(self.cfg, sid), daemon=True).start()
-        if self.cfg.get("claude_sessions", {}).get("reap_other_managed"):
-            self.reap_other_managed(cutoff)
+    # where activity.sessions looks; tests point them at fakes
+    proc_root = "/proc"
+    claude_home = None
 
-    def reap_other_managed(self, cutoff: float):
-        """[claude_sessions] reap_other_managed: the same inactivity rule for
-        every other session claude-sessions.sh manages (any source: mcp,
-        manual, ...), judged by pane output alone. A tmux session without
-        its CLAUDE_SESSION_SOURCE stamp is never touched, whatever its name.
-        Its activity is read again just before the kill."""
+    def reap_scope(self) -> str:
+        return str(self.cfg.get("claude_sessions", {}).get("reap_scope")
+                   or "brain")
+
+    def in_scope(self, s, scope: str) -> str | None:
+        """Why session `s` is ours to time out, or None."""
         from . import tools
-        seen = tools.tmux_activity()
-        if seen is None:
+        if s.tmux and s.tmux.startswith(tools.own_prefix(self.cfg)):
+            return "spawned"
+        if scope == "brain":
+            return None
+        source = tools.managed_source(s.tmux) if s.tmux else None
+        if source:
+            return f"managed by {source}"
+        return "claude session" if scope == "all" else None
+
+    def reap_idle(self, now: float | None = None):
+        """End every Claude session in scope ([claude_sessions] reap_scope:
+        brain = the ones we spawned, managed = any claude-sessions.sh one,
+        all = every claude process on the host) that has been inactive for
+        idle_minutes, with no tool in flight. Activity is what Claude's hooks
+        report plus its transcript writes (brain/activity.py); for workers
+        also each report and follow-up the brain saw. A tmux session that
+        claude-sessions.sh manages is torn down; any other claude process
+        gets SIGTERM (SIGKILL a sweep later if it is still there), leaving
+        its terminal alone."""
+        from . import activity, tools
+        now = time.time() if now is None else now
+        cutoff = now - self.idle_seconds()
+        scope = self.reap_scope()
+        found = activity.sessions(self.cfg, now, proc=self.proc_root,
+                                  claude_home=self.claude_home)
+        by_tmux = {s.tmux: s for s in found if s.tmux}
+        for sid in self.store.live_workers():
+            if sid in by_tmux:
+                self.store.touch_worker(sid, by_tmux[sid].last)
+        for s in found:
+            why = self.in_scope(s, scope)
+            if not why or s.last > cutoff or s.busy(now):
+                continue
+            w = self.store.worker(s.tmux) if s.tmux else None
+            live_worker = w and w["state"] not in ("reaped", "failed")
+            if live_worker and w["last_active"] and w["last_active"] > cutoff:
+                continue   # a follow-up or report the hooks haven't seen yet
+            if not activity.still_idle(s, self.cfg, cutoff, now,
+                                       proc=self.proc_root,
+                                       claude_home=self.claude_home):
+                continue
+            if live_worker and not self.store.claim_reap(s.tmux, cutoff):
+                continue
+            self._end(s, why, now)
+        self._reap_claudeless(set(by_tmux), scope, now)
+
+    def _reap_claudeless(self, with_claude: set, scope: str, now: float):
+        """Managed tmux sessions whose claude has exited are ended
+        idle_minutes after the reaper first saw them so; a live worker whose
+        tmux session is gone altogether is just marked reaped."""
+        from . import activity, tools
+        names = tools.tmux_sessions()
+        if names is None:
             return
-        prefix = tools.own_prefix(self.cfg)
-        for name, at in seen.items():
-            if name.startswith(prefix) or at > cutoff:
+        for sid in self.store.live_workers():
+            w = self.store.worker(sid)
+            if (sid not in names and now - w["created_at"] > 600
+                    and self.store.claim_reap(sid)):
+                self.db.step("", "worker_reaped", channel=w["origin_channel"],
+                             session=sid, reason="tmux session gone")
+        marks = os.path.join(activity.state_dir(self.cfg), "legacy")
+        os.makedirs(marks, exist_ok=True)
+        own = tools.own_prefix(self.cfg)
+        for name in names:
+            mark = os.path.join(marks, f"noclaude-{name}")
+            managed = (name.startswith(own) or scope != "brain") and \
+                tools.managed_source(name)
+            if name in with_claude or not managed:
+                activity._remove(mark)
                 continue
-            source = tools.managed_source(name)
-            if not source:
+            if not os.path.exists(mark):
+                with open(mark, "w") as f:
+                    f.write(str(now))
                 continue
-            fresh = tools.tmux_activity(name)
-            if fresh is None or not fresh or max(fresh.values()) > cutoff:
+            try:
+                with open(mark) as f:
+                    first = float(f.read().strip() or now)
+            except (OSError, ValueError):
                 continue
-            self.db.step("", "worker_reaped", channel="", session=name,
-                         reason=f"inactive, managed by {source}")
+            if now - first >= self.idle_seconds():
+                activity._remove(mark)
+                if self.store.worker(name):
+                    self.store.claim_reap(name)
+                self.db.step("", "worker_reaped", channel="", session=name,
+                             reason="claude exited, tmux left idle")
+                threading.Thread(target=tools.kill_session,
+                                 args=(self.cfg, name), daemon=True).start()
+        for mark in os.listdir(marks):
+            if mark.startswith("noclaude-") and mark[9:] not in names:
+                activity._remove(os.path.join(marks, mark))
+
+    def _end(self, s, why: str, now: float):
+        from . import tools
+        reason = (f"inactive {int(now - s.last) // 60} min, {why}"
+                  f"{', legacy' if s.legacy else ''}")
+        if s.tmux and tools.managed_source(s.tmux):
+            self.db.step("", "worker_reaped", channel="", session=s.tmux,
+                         pid=s.pid, reason=reason)
             threading.Thread(target=tools.kill_session,
-                             args=(self.cfg, name), daemon=True).start()
+                             args=(self.cfg, s.tmux), daemon=True).start()
+            return
+        key = (s.pid, s.start)
+        termed = getattr(self, "_termed", {})
+        self._termed = termed
+        sig = 9 if key in termed and now - termed[key] >= 30 else 15
+        termed.setdefault(key, now)
+        self.db.step("", "worker_reaped", channel="", session=s.tmux or "",
+                     pid=s.pid, signal=sig, reason=reason)
+        try:
+            os.kill(s.pid, sig)
+        except OSError:
+            pass
 
     def reap(self, sid: str | None, turn_id: str = ""):
         if sid and self.store.claim_reap(sid):

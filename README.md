@@ -121,16 +121,10 @@ sender's own tier.
   merged into it; otherwise it starts a turn there. A worker whose report
   starts with `[FINAL]` goes idle once that report has reached the origin:
   it stays up with its context so follow-ups sent to it over comms still
-  work. Every worker, idle or not, `[FINAL]` or not, is reaped once it has
-  been **inactive** for `idle_minutes` (default 480, 8 hours); it is not a
-  limit on run time. Activity is its spawn, each report it sends, each
-  follow-up sent to it (a failed send is undone), and any output in its tmux
-  pane (tmux `window_activity`: Claude's spinner and elapsed-time counter
-  redraw while it thinks or runs a tool, and an incoming comms message is
-  drawn too). Looking at the pane is not activity. The inbox ticker sweeps
-  once a minute; if tmux can't be read it reaps nothing. Sessions named
-  after this `source` that the worker table doesn't track as live (spawned
-  before it, or a kill that didn't take) are held to the same rule.
+  work. Every worker, idle or not, `[FINAL]` or not, is ended once it has
+  been **inactive** for `idle_minutes` (default 480, 8 hours) with no tool
+  in flight; it is not a limit on run time. See
+  [Inactivity timeout](#inactivity-timeout) for what counts as activity.
   Sending a worker a follow-up wakes it before the send; it owes a new
   `[FINAL]` for it. `claude_kill` ends one at any time.
   When a spawn fails, a `spawn FAILED: …` note lands in the origin
@@ -269,13 +263,48 @@ it is killed, whether or not it sent a `[FINAL]`. `0` kills a worker as soon
 as its `[FINAL]` reaches the origin; workers that never send one still time
 out after the default 480.
 
-`reap_other_managed = true` holds every other session that
-`claude-sessions.sh` created (whatever its `--source`: e.g. `mcp`, `manual`)
-to the same inactivity limit, judged by pane output alone, in the same
-once-a-minute sweep. A session counts as managed only by the
-`CLAUDE_SESSION_SOURCE` the script stamps on it, never by its name, so
-personal tmux sessions are never touched. Its activity is read again just
-before the kill, and `kill` itself refuses unmanaged sessions.
+#### Inactivity timeout
+
+Activity comes from Claude Code hooks, like Agent Monitor's:
+`scripts/claude-activity-hook.sh install` registers
+`scripts/claude-activity-hook.sh` in `~/.claude/settings.json` for
+SessionStart, UserPromptSubmit, PreToolUse, PostToolUse,
+PostToolUseFailure, PermissionRequest, Notification, Stop, StopFailure,
+SubagentStart, SubagentStop, PreCompact, PostCompact, Elicitation and
+ElicitationResult (a backup is left; `uninstall` undoes it). Every Claude
+on the host then appends each event to
+`<state_dir>/activity/<session_id>.log`, with its claude pid, the pid's
+`/proc` start time (so a reused pid never matches) and its tmux session.
+Subagents' tool calls arrive under their parent's session. Notification
+`idle_prompt`, the 60 s "waiting for your input" nudge, is not activity.
+
+Once a minute the brain looks at every live claude process. Its last
+activity is the latest hook event or transcript write (Claude writes the
+transcript as it works, even when no hook fires); for a worker, also each
+report and follow-up the brain saw. A tool whose PreToolUse has no
+PostToolUse yet is in flight: the session is busy however long it runs, up
+to 24 hours, after which it counts as hung. Reading any of this is not
+activity. Just before ending a session the brain reads it all again.
+
+`reap_scope` says whose sessions are ended: `"brain"` (default: the ones it
+spawned), `"managed"` (any session `claude-sessions.sh` made, which it
+stamps with `CLAUDE_SESSION_SOURCE`: `mcp`, `manual`, ...), or `"all"`
+(every claude process on the host). A managed session's tmux session is
+torn down. Any other claude gets SIGTERM, then SIGKILL a sweep later if it
+is still there; its terminal or tmux session is left alone. A managed tmux
+session whose claude has exited is ended `idle_minutes` after the brain
+first sees it so.
+
+Claude reads hooks at startup, so sessions already running when the hook is
+installed fire none. For those, the brain uses their transcript writes and
+Claude's own status file (`~/.claude/sessions/<pid>.json`; `busy` counts as
+a tool in flight), and their clock starts no earlier than when it first saw
+them. Installing the hook never ends a session sooner than `idle_minutes`
+later.
+
+Not covered: a background command or subagent that runs on after the turn
+ended and fires no hook for 8 hours (its completion would be activity); and
+everything stops while the brain is down.
 
 ### Vault (`[vault]`)
 

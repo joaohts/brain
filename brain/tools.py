@@ -226,42 +226,22 @@ def kill_session(cfg, sid: str) -> str:
     return r.stdout.strip() or r.stderr.strip() or f"killed {sid}"
 
 
-def tmux_activity(target: str | None = None) -> dict[str, float] | None:
-    """{tmux session: time of its last pane output} (all sessions, or just
-    `target`), or None if tmux can't be read. Reading it is not activity:
-    tmux updates window_activity only on output."""
-    cmd = ["tmux", "list-windows", "-F", "#{session_name}\t#{window_activity}"]
-    cmd += ["-t", target] if target else ["-a"]
+def tmux_sessions() -> set[str] | None:
+    """Names of all tmux sessions, or None if tmux can't be read."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                           capture_output=True, text=True, timeout=10)
     except Exception:
         return None
     if r.returncode != 0:
-        if target and ("can't find" in r.stderr or "no server" in r.stderr):
-            return {}
         if "no server running" in r.stderr or "error connecting" in r.stderr:
-            return {}
+            return set()
         return None
-    seen: dict[str, float] = {}
-    for line in r.stdout.splitlines():
-        name, _, at = line.partition("\t")
-        if at.isdigit():
-            seen[name] = max(seen.get(name, 0.0), float(at))
-    return seen
+    return set(r.stdout.split())
 
 
 def own_prefix(cfg) -> str:
     return f"{cfg['claude_sessions'].get('source') or 'brain'}-"
-
-
-def pane_activity(cfg) -> dict[str, float] | None:
-    """tmux_activity() of the sessions named after our [claude_sessions]
-    source, or None if tmux can't be read."""
-    seen = tmux_activity()
-    if seen is None:
-        return None
-    prefix = own_prefix(cfg)
-    return {n: at for n, at in seen.items() if n.startswith(prefix)}
 
 
 def managed_source(name: str) -> str | None:

@@ -69,17 +69,73 @@ class Base(unittest.TestCase):
         self.brain = inbox.Brain(cfg, self.db, client_factory=lambda: self.client,
                                  lease_seconds=60)
         self.killed = []
-        self._kill = tools.kill_session
-        tools.kill_session = lambda cfg, sid: self.killed.append(sid) or "killed"
-        # tmux stubbed: {session: last pane output}; None = unreadable
-        self.panes = {}
-        self._panes = tools.pane_activity
-        tools.pane_activity = lambda cfg: self.panes
+        self._saved = (tools.kill_session, tools.managed_source,
+                       tools.tmux_sessions)
+        tools.kill_session = self.fake_kill
+        # the host, faked: claude processes under proc/, tmux sessions and
+        # their CLAUDE_SESSION_SOURCE stamps, hook logs under state/
+        self.proc = os.path.join(self.tmp.name, "proc")
+        os.makedirs(self.proc)
+        self.brain.proc_root = self.proc
+        self.brain.claude_home = os.path.join(self.tmp.name, "claude")
+        cfg["claude_sessions"]["state_dir"] = os.path.join(self.tmp.name, "state")
+        cfg["claude_sessions"]["reap_scope"] = "managed"
+        self.tmux, self.sources, self.pids = set(), {}, {}
+        tools.managed_source = lambda name: self.sources.get(name)
+        from brain import activity
+        self._tmux_of = activity.tmux_of
+        activity.tmux_of = lambda pid, proc="/proc": self.pane_of.get(pid, "")
+        self.pane_of = {}
+        tools.tmux_sessions = lambda: None if self.tmux is None else set(self.tmux)
 
     def tearDown(self):
-        tools.kill_session = self._kill
-        tools.pane_activity = self._panes
+        (tools.kill_session, tools.managed_source,
+         tools.tmux_sessions) = self._saved
+        from brain import activity
+        activity.tmux_of = self._tmux_of
         self.tmp.cleanup()
+
+    def fake_kill(self, cfg, sid):
+        """claude-sessions.sh kill: the tmux session and its claude go."""
+        self.killed.append(sid)
+        self.tmux.discard(sid)
+        pid = self.pids.pop(sid, None)
+        if pid:
+            import shutil
+            shutil.rmtree(os.path.join(self.proc, str(pid)), ignore_errors=True)
+        return "killed"
+
+    def claude(self, tmux="", source="brain", sid="", at=None, start="100"):
+        """A live claude process (optionally inside a tmux session); with
+        sid, its hook log starts with SessionStart at `at`."""
+        pid = 1000 + len(os.listdir(self.proc))
+        d = os.path.join(self.proc, str(pid))
+        os.makedirs(d)
+        fields = ["S", "1"] + ["0"] * 17 + [start, "0"]
+        with open(os.path.join(d, "stat"), "w") as f:
+            f.write(f"{pid} (claude) " + " ".join(fields))
+        if tmux:
+            self.tmux.add(tmux)
+            self.pids[tmux] = pid
+            self.pane_of[pid] = tmux
+            if source:
+                self.sources[tmux] = source
+        if sid:
+            self.hook(sid, "SessionStart", time.time() if at is None else at,
+                      pid=pid, start=start, tmux=tmux)
+        return pid
+
+    def hook(self, sid, event, at, detail="", pid=None, start="100", tmux="",
+             transcript=""):
+        d = os.path.join(self.cfg["claude_sessions"]["state_dir"], "activity")
+        os.makedirs(d, exist_ok=True)
+        if pid is None:   # continue the session's own process
+            with open(os.path.join(d, f"{sid}.log")) as f:
+                last = f.read().splitlines()[-1].split("\t")
+            pid, start, tmux = int(last[4]), last[5], last[6]
+        with open(os.path.join(d, f"{sid}.log"), "a") as f:
+            f.write("\t".join([str(int(at * 1000)), event, detail, transcript,
+                               str(pid), start, tmux]) + "\n")
 
     def env(self, text_, sender="Owner (cli)", tier="owner", channel="cli", **kw):
         return dict(channel=channel, sender=sender, tier=tier, text=text_, **kw)
@@ -94,7 +150,9 @@ class Base(unittest.TestCase):
     def worker(self, sid="w1", origin="cli", recipient="m_x:a_w"):
         self.brain.store.add_worker(sid, origin, "", "Owner (cli)", "summarize the logs")
         self.brain.store.set_worker(sid, recipient=recipient, state="running")
-        return self.brain.store.worker(sid)
+        w = self.brain.store.worker(sid)
+        self.claude(tmux=sid, sid=f"cs-{sid}", at=w["created_at"])
+        return w
 
     def submit_worker(self, body, w=None, pid="comms:m_x:msg1"):
         w = w or self.brain.store.worker("w1")
@@ -502,27 +560,47 @@ class WorkerTests(Base):
         self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
         self.assertEqual(len(self.steps("worker_reaped")), 1)
 
-    def test_pane_output_keeps_a_long_task_alive(self):
-        """Not an execution limit: a worker printing output 10 h after its
-        spawn (no report, no [FINAL]) lives on; 8 h after its last output
-        it is reaped."""
+    def test_hook_activity_keeps_a_long_task_alive(self):
+        """Not an execution limit: tool calls 10 h after the spawn (no
+        report, no [FINAL]) keep it; 8 h after the last one it is reaped."""
         w = self.worker()
         t0 = w["created_at"]
-        self.panes = {"w1": t0 + 10 * 3600}
+        self.hook("cs-w1", "PreToolUse", t0 + 10 * 3600 - 5, "toolu_1")
+        self.hook("cs-w1", "PostToolUse", t0 + 10 * 3600, "toolu_1")
         self.assertNotReaped(t0 + 10 * 3600 + self.IDLE - 1)
-        self.assertEqual(self.brain.store.worker("w1")["last_active"],
-                         t0 + 10 * 3600)
         self.brain.reap_idle(now=t0 + 10 * 3600 + self.IDLE + 1)
         self.wait_reaped()
         self.assertEqual(self.killed, ["w1"])
 
-    def test_pane_output_renews_an_idle_worker(self):
-        self.worker()
-        self.final()
-        t = self.brain.store.worker("w1")["last_active"]
-        self.panes = {"w1": t + 3600}
-        self.assertNotReaped(t + self.IDLE + 1)
-        self.assertEqual(self.brain.store.worker("w1")["state"], "idle")
+    def test_a_tool_in_flight_is_protected_until_the_cap(self):
+        from brain import activity
+        w = self.worker()
+        t0 = w["created_at"]
+        self.hook("cs-w1", "PreToolUse", t0 + 60, "toolu_long")
+        self.assertNotReaped(t0 + 60 + self.IDLE + 3600)
+        self.brain.reap_idle(now=t0 + 60 + activity.TOOL_CAP + 1)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["w1"])
+
+    def test_a_finished_tool_no_longer_protects(self):
+        w = self.worker()
+        t0 = w["created_at"]
+        self.hook("cs-w1", "PreToolUse", t0 + 1, "a")
+        self.hook("cs-w1", "PreToolUse", t0 + 2, "b")
+        self.hook("cs-w1", "PostToolUseFailure", t0 + 3, "a")
+        self.hook("cs-w1", "PostToolUse", t0 + 4, "b")
+        self.brain.reap_idle(now=t0 + 4 + self.IDLE + 1)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["w1"])
+
+    def test_transcript_writes_count_as_activity(self):
+        w = self.worker()
+        t0 = w["created_at"]
+        tr = os.path.join(self.tmp.name, "t.jsonl")
+        open(tr, "w").close()
+        os.utime(tr, (t0 + 5 * 3600, t0 + 5 * 3600))
+        self.hook("cs-w1", "UserPromptSubmit", t0 + 1, transcript=tr)
+        self.assertNotReaped(t0 + 5 * 3600 + self.IDLE - 1)
 
     def test_a_report_counts_as_activity_on_arrival(self):
         w = self.worker()
@@ -536,28 +614,92 @@ class WorkerTests(Base):
         self.assertAlmostEqual(self.brain.store.worker("w1")["last_active"],
                                time.time(), delta=5)
 
-    def test_unreadable_panes_reap_nothing(self):
-        w = self.worker()
-        self.panes = None
-        self.assertNotReaped(w["created_at"] + 10 * self.IDLE)
-        self.assertEqual(self.brain.store.worker("w1")["state"], "running")
-
-    def test_untracked_sessions_of_ours_are_held_to_the_same_rule(self):
+    def test_legacy_session_gets_its_full_period_from_migration(self):
+        """A claude that started before the hook was registered fires no
+        hooks: its clock starts when the reaper first sees it."""
         now = time.time()
-        self.worker("w1")
-        self.brain.store.set_worker("w1", state="failed")   # e.g. spawn failed
-        self.panes = {"old": now - self.IDLE - 60, "fresh": now - 60,
-                      "w1": now - self.IDLE - 1}
-        self.brain.reap_idle(now=now)
-        for _ in range(50):
-            if len(self.killed) == 2:
-                break
-            time.sleep(0.02)
-        self.assertEqual(sorted(self.killed), ["old", "w1"])
+        self.claude(tmux="mcp-old", source="mcp")       # no hook log
+        self.assertNotReaped(now)                       # first seen: now
+        self.assertNotReaped(now + self.IDLE - 60)
+        self.brain.reap_idle(now=now + self.IDLE + 60)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["mcp-old"])
+
+    def test_legacy_session_busy_in_claudes_status_file_is_protected(self):
+        now = time.time()
+        pid = self.claude(tmux="", source="")
+        reg = os.path.join(self.brain.claude_home, "sessions")
+        os.makedirs(reg)
+        with open(os.path.join(reg, f"{pid}.json"), "w") as f:
+            json.dump({"pid": pid, "procStart": "100", "sessionId": "s-old",
+                       "tmux": "mcp-busy:@1.%1", "status": "busy",
+                       "statusUpdatedAt": now * 1000}, f)
+        self.sources["mcp-busy"] = "mcp"
+        self.assertNotReaped(now)
+        self.assertNotReaped(now + self.IDLE + 60)
+
+    def test_unmanaged_sessions_are_left_alone_in_managed_scope(self):
+        now = time.time()
+        self.claude(tmux="personal", source="", sid="cs-p", at=now)
+        self.claude(sid="cs-term", at=now)              # a plain terminal
+        from unittest import mock
+        with mock.patch.object(os, "kill") as kill:
+            self.assertNotReaped(now + 10 * self.IDLE)
+            kill.assert_not_called()
+
+    def test_all_scope_ends_any_idle_claude_with_term_then_kill(self):
+        from unittest import mock
+        self.cfg["claude_sessions"]["reap_scope"] = "all"
+        now = time.time()
+        pid = self.claude(sid="cs-term", at=now)        # a plain terminal
+        busy = self.claude(sid="cs-busy", at=now)
+        self.hook("cs-busy", "PreToolUse", now + 1, "t")
+        with mock.patch.object(os, "kill") as kill:
+            self.brain.reap_idle(now=now + self.IDLE - 1)
+            kill.assert_not_called()
+            self.brain.reap_idle(now=now + self.IDLE + 1)
+            kill.assert_called_once_with(pid, 15)
+            self.brain.reap_idle(now=now + self.IDLE + 40)   # still there
+            kill.assert_called_with(pid, 9)
+        self.assertNotIn(busy, [c.args[0] for c in kill.call_args_list])
+        self.assertEqual(self.killed, [])               # its terminal stays
+
+    def test_a_reused_pid_is_not_the_old_session(self):
+        now = time.time()
+        pid = self.claude(tmux="mcp-x", source="mcp", start="200")
+        self.hook("cs-gone", "SessionStart", now - 10 * self.IDLE, pid=pid,
+                  start="100", tmux="mcp-x")            # older process, same pid
+        self.assertNotReaped(now)                       # new one: legacy, fresh
+
+    def test_claude_exited_but_its_managed_tmux_remains(self):
+        now = time.time()
+        self.tmux.add("mcp-shell")
+        self.sources["mcp-shell"] = "mcp"
+        self.tmux.add("personal-shell")                 # unmanaged: never
+        self.assertNotReaped(now)
+        self.assertNotReaped(now + self.IDLE - 60)
+        self.brain.reap_idle(now=now + self.IDLE + 60)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["mcp-shell"])
+
+    def test_worker_whose_tmux_is_gone_is_marked_reaped(self):
+        w = self.worker()
+        self.fake_kill(self.cfg, "w1")
+        self.killed.clear()
+        self.brain.reap_idle(now=w["created_at"] + 601)
+        self.assertEqual(self.brain.store.worker("w1")["state"], "reaped")
+        self.assertEqual(self.killed, [])
+
+    def test_unreadable_tmux_reaps_no_claudeless_session(self):
+        w = self.worker()
+        self.fake_kill(self.cfg, "w1")
+        self.killed.clear()
+        self.tmux = None
+        self.brain.reap_idle(now=w["created_at"] + 10 * self.IDLE)
+        self.assertEqual(self.brain.store.worker("w1")["state"], "running")
 
     def test_a_worker_is_killed_once_per_sweep(self):
         w = self.worker()
-        self.panes = {"w1": w["created_at"]}
         self.brain.reap_idle(now=w["created_at"] + self.IDLE + 1)
         time.sleep(0.1)
         self.assertEqual(self.killed, ["w1"])
@@ -570,66 +712,45 @@ class WorkerTests(Base):
         self.wait_reaped()
         self.assertEqual(self.killed, ["w1"])
 
-    def other_managed(self, sessions, sources, later=None):
-        """reap_other_managed with tmux stubbed: sessions {name: activity},
-        sources {name: CLAUDE_SESSION_SOURCE}, later {name: activity seen on
-        the re-read just before the kill}."""
-        from unittest import mock
-        self.cfg["claude_sessions"]["reap_other_managed"] = True
-        later = later or {}
-
-        def activity(target=None):
-            if target is None:
-                return dict(sessions)
-            return {target: later.get(target, sessions[target])}
-        with mock.patch.object(tools, "tmux_activity", activity), \
-             mock.patch.object(tools, "managed_source", sources.get):
-            self.brain.reap_idle(now=self.now)
-        time.sleep(0.1)
-        return sorted(self.killed)
-
-    def test_other_managed_sessions_time_out_by_pane_output(self):
-        self.now = time.time()
-        old, fresh = self.now - self.IDLE - 60, self.now - 60
-        killed = self.other_managed(
-            {"mcp-1": old, "manual-2": old, "mcp-3": fresh,
-             "personal": old, "mcp-unstamped": old},
-            {"mcp-1": "mcp", "manual-2": "manual", "mcp-3": "mcp"})
-        # unstamped tmux sessions are never touched, whatever their name
-        self.assertEqual(killed, ["manual-2", "mcp-1"])
-        reasons = [json.loads(r[0])["reason"] for r in self.steps("worker_reaped")]
-        self.assertIn("inactive, managed by mcp", reasons)
-
-    def test_other_managed_session_with_new_output_since_the_listing_lives(self):
-        self.now = time.time()
-        old = self.now - self.IDLE - 60
-        self.assertEqual(self.other_managed(
-            {"mcp-1": old}, {"mcp-1": "mcp"}, later={"mcp-1": self.now - 1}), [])
-
-    def test_other_managed_is_off_by_default_and_leaves_our_own_alone(self):
-        self.now = time.time()
-        old = self.now - self.IDLE - 60
+    def test_brain_scope_only_times_out_our_own(self):
+        self.cfg["claude_sessions"]["reap_scope"] = "brain"
         self.cfg["claude_sessions"]["source"] = "brain"
-        self.assertNotIn("reap_other_managed",
-                         {k for k, v in self.cfg["claude_sessions"].items() if v})
-        # ours ("brain-…") are judged by the worker table / own sweep instead
-        self.panes = {}
-        self.assertEqual(self.other_managed({"brain-1": old},
-                                            {"brain-1": "brain"}), [])
+        now = time.time()
+        self.claude(tmux="mcp-1", source="mcp", sid="cs-m", at=now)
+        self.claude(tmux="brain-1", source="brain", sid="cs-b", at=now)
+        self.brain.reap_idle(now=now + self.IDLE + 1)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["brain-1"])
 
-    def test_pane_activity_reads_only_our_sessions(self):
-        from unittest import mock
-        out = "joana-1a\t100\njoana-1a\t250\nmcp-9\t300\njoanax\t5\n"
-        self.cfg["claude_sessions"]["source"] = "joana"
-        with mock.patch.object(tools.subprocess, "run", return_value=NS(
-                returncode=0, stdout=out, stderr="")):
-            self.assertEqual(self._panes(self.cfg), {"joana-1a": 250.0})
-        with mock.patch.object(tools.subprocess, "run", return_value=NS(
-                returncode=1, stdout="", stderr="no server running on /tmp/x")):
-            self.assertEqual(self._panes(self.cfg), {})
-        with mock.patch.object(tools.subprocess, "run", return_value=NS(
-                returncode=1, stdout="", stderr="permission denied")):
-            self.assertIsNone(self._panes(self.cfg))
+    def test_the_hook_records_events_and_skips_idle_nudges(self):
+        import subprocess
+        hook = os.path.join(config.REPO, "scripts", "claude-activity-hook.sh")
+        state = os.path.join(self.tmp.name, "hookstate")
+        env = dict(os.environ, CLAUDE_SESSIONS_STATE_DIR=state)
+        env.pop("TMUX_PANE", None)
+
+        def fire(**payload):
+            subprocess.run(["bash", hook], input=json.dumps(payload),
+                           text=True, env=env, check=True, timeout=10)
+        log = os.path.join(state, "activity", "s1.log")
+        fire(hook_event_name="SessionStart", session_id="s1")
+        fire(hook_event_name="PreToolUse", session_id="s1", tool_use_id="t1",
+             transcript_path="/x/s1.jsonl")
+        fire(hook_event_name="Notification", session_id="s1",
+             notification_type="idle_prompt")
+        fire(hook_event_name="Notification", session_id="s1",
+             notification_type="permission_prompt")
+        fire(hook_event_name="SessionEnd", session_id="s1")
+        fire(hook_event_name="PreToolUse", session_id="../evil")
+        rows = [l.split("\t") for l in open(log).read().splitlines()]
+        self.assertEqual([(r[1], r[2], r[3]) for r in rows],
+                         [("SessionStart", "", ""),
+                          ("PreToolUse", "t1", "/x/s1.jsonl"),
+                          ("Notification", "permission_prompt", "")])
+        self.assertTrue(all(len(r) == 7 for r in rows))
+        fire(hook_event_name="Stop", session_id="s1")   # starts over
+        self.assertEqual(len(open(log).read().splitlines()), 1)
+        self.assertEqual(os.listdir(os.path.join(state, "activity")), ["s1.log"])
 
     def test_old_workers_table_is_migrated(self):
         import sqlite3
