@@ -1,59 +1,42 @@
 """HTTP door — submit-and-poll, so no client ever blocks on the brain's lock.
 
-  POST /turn {channel, sender, tier, text}        -> 202 {"id": t}
+  POST /turn {channel, sender, tier, text[, thread, provider_id]}
+                                                  -> 202 {"id": "m<n>", "duplicate": false}
   POST /turn {..., "wait": true}                  -> 200 {"reply": ...}  (blocking, for curl/tests)
-  GET  /turn/<id>                                 -> {"status": "pending"}
+  GET  /turn/<id>                                 -> {"status": "pending" | "running"}
                                                      {"status": "done", "reply": ...}
+                                                     {"status": "error", "error": ...}
 
-The brain serializes globally (one thought at a time) and a turn may take
-minutes; results are held in memory until fetched (or ~30 min). Also runs the
-timer loop: due timers become self-envelopes."""
+Every request is written to the inbox first (brain/inbox.py); turns answer
+inbox rows one at a time. A message merged into a running turn of the same
+sender finishes as "done" with an empty reply (the turn's own reply covers
+it). provider_id is a dedup key: a repeat returns the original id with
+"duplicate": true. Also runs the timer loop: due timers become inbox rows."""
 
 import json
 import threading
 import time
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import config
+from . import config, inbox
 from .db import DB
-from .loop import run_turn
 
 cfg = config.load()
 db = DB(cfg["db_path"])
+brain = inbox.get(cfg, db)
 
-_results: dict[str, dict] = {}
-_results_guard = threading.Lock()
-RESULT_TTL = 1800
-
-
-def _submit(env: dict) -> str:
-    tid = f"turn_{uuid.uuid4().hex[:10]}"
-    with _results_guard:
-        _results[tid] = {"status": "pending", "ts": time.time()}
-
-    def job():
-        def mark_running():
-            with _results_guard:
-                _results[tid] = {"status": "running", "ts": time.time()}
-        try:
-            reply = run_turn(env, cfg, db, on_start=mark_running)
-            status = {"status": "done", "reply": reply}
-        except Exception as e:
-            status = {"status": "error", "error": str(e)}
-        with _results_guard:
-            _results[tid] = {**status, "ts": time.time()}
-
-    threading.Thread(target=job, daemon=True).start()
-    return tid
+_STATUS = {"unread": "pending", "read_by_turn": "running"}
 
 
-def _gc_results():
-    with _results_guard:
-        dead = [k for k, v in _results.items()
-                if time.time() - v["ts"] > RESULT_TTL]
-        for k in dead:
-            del _results[k]
+def _view(row: dict | None) -> tuple[int, dict]:
+    if row is None:
+        return 404, {"error": "unknown turn id"}
+    if row["state"] != "done":
+        return 200, {"status": _STATUS[row["state"]]}
+    if row.get("error"):
+        return 200, {"status": "error", "error": row["error"]}
+    return 200, {"status": "done", "reply": row.get("reply") or "",
+                 "merged": bool(row.get("merged"))}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -71,10 +54,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             env = json.loads(body)
-            if env.pop("wait", False):
-                self._json(200, {"reply": run_turn(env, cfg, db)})
-            else:
-                self._json(202, {"id": _submit(env)})
+            wait = env.pop("wait", False)
+            for k in ("channel", "sender", "tier", "text"):
+                if not isinstance(env.get(k), str):
+                    return self._json(400, {"error": f"missing field: {k}"})
+            if env["tier"] == "agent" or env["tier"] not in (
+                    "owner", "family", "unknown"):
+                return self._json(400, {"error": "tier must be owner|family|unknown"})
+            row_id, dup = brain.submit(env)
+            if wait:
+                code, view = _view(brain.wait(row_id))
+                if view.get("status") == "error":
+                    return self._json(500, {"error": view["error"]})
+                return self._json(200, {"reply": view.get("reply", "")})
+            self._json(202, {"id": f"m{row_id}", "duplicate": dup})
         except Exception as e:
             self._json(500, {"error": str(e)})
 
@@ -82,14 +75,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self.path.startswith("/turn/"):
             self.send_error(404)
             return
-        _gc_results()
         tid = self.path.rsplit("/", 1)[1]
-        with _results_guard:
-            r = _results.get(tid)
-        if r is None:
-            self._json(404, {"error": "unknown turn id"})
-        else:
-            self._json(200, {k: v for k, v in r.items() if k != "ts"})
+        try:
+            row = brain.store.get(int(tid.lstrip("m")))
+        except ValueError:
+            row = None
+        code, view = _view(row)
+        self._json(code, view)
 
     def log_message(self, *a):
         pass
@@ -99,19 +91,21 @@ def timer_loop():
     while True:
         time.sleep(10)
         for t in db.due_timers():
+            brain.submit(dict(channel=t["channel"], sender="timer (internal)",
+                              tier="owner", provider_id=f"timer:{t['id']}",
+                              text=f"[TIMER FIRED] Deliver this reminder now, "
+                                   f"in {cfg['language']}, on this channel: "
+                                   f"{t['message']}"))
             db.finish_timer(t["id"])
-            _submit(dict(channel=t["channel"], sender="timer (internal)",
-                         tier="owner",
-                         text=f"[TIMER FIRED] Deliver this reminder now, "
-                              f"in {cfg['language']}, on this channel: "
-                              f"{t['message']}"))
 
 
 def main():
+    brain.start()
     threading.Thread(target=timer_loop, daemon=True).start()
     if config.enabled(cfg, "comms"):
         # enabled-but-broken fails loud: the service exits and systemd shows why
         from .comms_v1 import start
+        from .loop import run_turn
         start(run_turn, cfg, db)
         print(f"[comms] attached as {cfg['comms']['alias']}", flush=True)
     print(f"[brain] {cfg['assistant_name']} on {cfg['model']}, listening on "

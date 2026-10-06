@@ -15,6 +15,9 @@ import uuid
 from .config import enabled
 
 RING = {"unknown": 0, "family": 1, "owner": 2}
+# "agent" (worker results, never owner) ranks 0 and is further limited to the
+# tools flagged agent=True; its send_to only reaches its origin channel.
+AGENT = "agent"
 
 CLAUDE_BIN = (shutil.which("claude")
               or os.path.expanduser("~/.local/bin/claude"))
@@ -36,9 +39,11 @@ def contacts(cfg) -> dict:
     return {v["alias"]: v for v in raw.values() if v.get("alias")}
 
 
-def deliver(channel: str, message: str, origin: str, cfg, db) -> str:
+def deliver(channel: str, message: str, origin: str, cfg, db,
+            record: bool = True) -> str:
     """Route a message into a channel via its adapter (shared by send_to and
-    async job delivery)."""
+    async job delivery). record=False when the caller already stored the text
+    in the thread (e.g. a turn reply delivered to its origin)."""
     if channel.startswith("wpp:") and enabled(cfg, "whatsapp"):
         import json as _json
         import urllib.request
@@ -70,8 +75,9 @@ def deliver(channel: str, message: str, origin: str, cfg, db) -> str:
         status = "delivered on cli"
     else:
         return f"unknown or disabled channel: {channel}"
-    db.add_message(channel, "assistant", f"{cfg['assistant_name']} ({origin})",
-                   message)
+    if record:
+        db.add_message(channel, "assistant",
+                       f"{cfg['assistant_name']} ({origin})", message)
     return status
 
 
@@ -90,6 +96,13 @@ def t_remember(env, args, cfg, db):
 
 
 def t_send_to(env, args, cfg, db):
+    if env.get("tier") == AGENT:
+        origin = env.get("origin") or env["channel"]
+        if args["channel"] != origin:
+            db.step(env.get("turn_id", ""), "policy_denial", channel=env["channel"],
+                    tool="send_to", target=args["channel"], sender=env["sender"])
+            return (f"denied by policy: an agent-tier turn can only deliver to "
+                    f"its origin channel ({origin})")
     return deliver(args["channel"], args["message"],
                    f"relayed from {env['channel']}", cfg, db)
 
@@ -118,81 +131,140 @@ def _pane_problem(sid: str, settled: bool) -> str:
     return ""
 
 
-def t_claude_spawn(env, args, cfg, db):
-    """Managed Claude Code session (scripts/claude-sessions.sh): tmux + remote
-    control + comms membership. The session reports to the brain's comms
-    alias; reports arrive on the immutable comms-v1:<machine>:<agent> channel."""
-    import json as _json
-    cwd = args.get("cwd") or os.path.expanduser("~")
+def _session_env():
     env2 = dict(os.environ)
     env2["PATH"] = (os.path.expanduser("~/.local/bin") + ":"
                     + os.path.expanduser("~/.local/node/current/bin") + ":"
                     + env2.get("PATH", "/usr/bin:/bin"))
+    return env2
+
+
+def _create_session(cfg, cwd: str) -> str:
+    """Start a managed session; returns its id or raises with the reason."""
+    import json as _json
+    r = subprocess.run(["bash", cfg["claude_sessions"]["script"], "create",
+                        "--cwd", cwd,
+                        "--source", cfg["claude_sessions"]["source"]],
+                       capture_output=True, text=True, timeout=90,
+                       env=_session_env())
     try:
-        r = subprocess.run(["bash", cfg["claude_sessions"]["script"], "create",
-                            "--cwd", cwd,
-                            "--source", cfg["claude_sessions"]["source"]],
-                           capture_output=True, text=True, timeout=90,
-                           env=env2)
-        info = _json.loads(r.stdout)
+        return _json.loads(r.stdout)["id"]
+    except (ValueError, KeyError):
+        raise RuntimeError(f"session create failed: "
+                           f"{(r.stderr or r.stdout or '').strip()[-300:]}")
+
+
+def _find_peer(sid: str) -> str | None:
+    """Exact recipient id of session-<sid> once its comms receiver is online.
+    `comms who` may print the alias bare or host-qualified (<host>:session-x)."""
+    import json as _json
+    who = subprocess.run(["comms", "who", "--compact"],
+                         capture_output=True, text=True, timeout=15)
+    if who.returncode:
+        return None
+    try:
+        peers = _json.loads(who.stdout)
+    except ValueError:
+        return None
+    peer = next((p for p in peers
+                 if str(p.get("address", "")).rsplit(":", 1)[-1] == f"session-{sid}"
+                 and p.get("online")), None)
+    return peer["recipient"] if peer else None
+
+
+def _post_task(cfg, recipient: str, sid: str, task: str) -> str:
+    """Submit the task with an idempotent id; returns '' or the error."""
+    posted = subprocess.run(["comms", "post", "--from", cfg["comms"]["alias"],
+                             "--to", recipient, "--id", f"brain_spawn_{sid}",
+                             "--stdin", "--compact"], input=task,
+                            capture_output=True, text=True, timeout=15)
+    if posted.returncode:
+        return posted.stderr.strip() or "post failed"
+    return ""
+
+
+def kill_session(cfg, sid: str) -> str:
+    r = subprocess.run([cfg["claude_sessions"]["script"], "kill", sid],
+                       capture_output=True, text=True, timeout=15)
+    return r.stdout.strip() or r.stderr.strip() or f"killed {sid}"
+
+
+SPAWN_POLL_SECONDS = 3
+SPAWN_POLL_ATTEMPTS = 20
+
+
+def _spawn_job(origin: dict, task_text: str, cwd: str, cfg, db):
+    """Background half of claude_spawn. Success: the worker is tasked and its
+    later messages route to the origin thread (brain/inbox.py). Failure: a
+    system note lands in the origin thread so the requester is told."""
+    from . import inbox
+    brain = inbox.current()
+    sid = None
+
+    def fail(reason):
+        db.step(origin["turn_id"], "spawn_failed", channel=origin["channel"],
+                session=sid, reason=reason)
+        if sid:
+            brain.store.set_worker(sid, state="failed")
+        brain.submit({"channel": origin["channel"], "thread": origin["thread"],
+                      "sender": "system (claude_spawn)", "tier": AGENT,
+                      "text": _spawn_failed(reason),
+                      "provider_id": f"spawn_failed:{origin['turn_id']}:{sid}"},
+                     route="deliver", meta={"deliver_to": origin["channel"]},
+                     kind="system")
+
+    try:
+        sid = _create_session(cfg, cwd)
     except Exception as e:
-        err = ""
-        try:
-            err = (r.stderr or r.stdout or "")[-300:]
-        except NameError:
-            pass
-        return _spawn_failed(f"session create failed: {e} {err}".strip())
-    sid = info["id"]
-    target = f"session-{sid}"
-    brain_alias = cfg["comms"]["alias"]
+        return fail(str(e) or type(e).__name__)
+    brain.store.add_worker(sid, origin["channel"], origin["thread"],
+                           origin["sender"], task_text)
     task = (f"{cfg['assistant_name']} ({cfg['owner_name']}'s assistant) spawned "
-            f"you for a task that came from "
-            f"channel {env['channel']}. Report progress sparingly and the "
-            f"final result via comms to {brain_alias}; state in the final report "
-            f"that it is for {env['channel']}. After the final report is "
-            f"sent (and any handoffs acknowledged), close comms and end this "
-            f"session with /exit — finished workers are reaped. "
-            f"Task: {args['task']}")
-    # Wait for the exact new local agent's harness-owned receiver. Resolve its
-    # alias once, then submit to immutable IDs with an idempotent task ID.
-    # `comms who` may print the alias bare or host-qualified (<host>:session-x).
-    for attempt in range(20):
-        time.sleep(3)
+            f"you for a task that came from channel {origin['channel']}. Report "
+            f"progress sparingly via comms to {cfg['comms']['alias']}; start your "
+            f"final report with {inbox.FINAL_MARK}. Each report is relayed to "
+            f"that channel. After the final report is sent (and any handoffs "
+            f"acknowledged), close comms and end this session with /exit — "
+            f"finished workers are reaped. Task: {task_text}")
+    # Wait for the exact new local agent's harness-owned receiver, then
+    # submit to its immutable id with an idempotent task id.
+    for attempt in range(SPAWN_POLL_ATTEMPTS):
+        time.sleep(SPAWN_POLL_SECONDS)
         dead = _pane_problem(sid, settled=attempt >= 2)
         if dead:
-            return _spawn_failed(f"session {sid}: {dead}")
-        who = subprocess.run(["comms", "who", "--compact"],
-                             capture_output=True, text=True, timeout=15)
-        if who.returncode:
+            return fail(f"session {sid}: {dead}")
+        recipient = _find_peer(sid)
+        if not recipient:
             continue
-        try:
-            peers = _json.loads(who.stdout)
-        except ValueError:
-            continue
-        peer = next((p for p in peers
-                     if str(p.get("address", "")).rsplit(":", 1)[-1] == target
-                     and p.get("online")), None)
-        if peer is None:
-            continue
-        target = peer["recipient"]
-        posted = subprocess.run(["comms", "post", "--from", brain_alias,
-                                 "--to", target, "--id", f"brain_spawn_{sid}",
-                                 "--stdin", "--compact"], input=task,
-                                capture_output=True, text=True, timeout=15)
-        if posted.returncode:
-            return _spawn_failed(
-                f"session {sid} joined, but task submission failed or is "
-                f"uncertain ({posted.stderr.strip()}); check message "
-                f"brain_spawn_{sid} before retrying")
-        break
-    else:
-        return _spawn_failed(f"session {sid} created but its comms receiver "
-                             f"never came online (tmux attach -t {sid})")
-    db.step(env["turn_id"], "session_spawned", channel=env["channel"],
-            session=sid, cwd=cwd, task=args["task"])
-    return (f"session {sid} spawned and tasked. It reports back on channel "
-            f"comms-v1:{target}; message it with send_to on that "
-            f"channel. Tell the user the work has started.")
+        brain.store.set_worker(sid, recipient=recipient, state="running")
+        err = _post_task(cfg, recipient, sid, task)
+        if err:
+            return fail(f"session {sid} joined, but task submission failed or "
+                        f"is uncertain ({err}); check message brain_spawn_{sid}")
+        db.step(origin["turn_id"], "session_spawned", channel=origin["channel"],
+                session=sid, cwd=cwd, task=task_text)
+        return None
+    return fail(f"session {sid} created but its comms receiver never came "
+                f"online (tmux attach -t {sid})")
+
+
+def t_claude_spawn(env, args, cfg, db):
+    """Managed Claude Code session (scripts/claude-sessions.sh): tmux + remote
+    control + comms membership. Asynchronous: returns at once; the worker's
+    reports arrive later as messages in this conversation."""
+    from . import inbox
+    if inbox.current() is None:
+        return _spawn_failed("the inbox dispatcher is not running")
+    origin = {"channel": env.get("origin") or env["channel"],
+              "thread": env.get("thread") or "", "sender": env["sender"],
+              "turn_id": env.get("turn_id", "")}
+    cwd = args.get("cwd") or os.path.expanduser("~")
+    threading.Thread(target=_spawn_job, args=(origin, args["task"], cwd, cfg, db),
+                     daemon=True, name="claude-spawn").start()
+    return ("Worker starting in the background. Delegation is asynchronous: "
+            "the worker's result arrives later as a new message in this "
+            "conversation, in a new turn. Tell the requester the work has "
+            "started and end this turn; there is nothing to wait for or poll.")
 
 
 def t_comms_who(env, args, cfg, db):
@@ -223,10 +295,7 @@ def _norm_sid(sid):
 
 def t_claude_kill(env, args, cfg, db):
     sid = _norm_sid(args["session_id"])
-    r = subprocess.run([cfg["claude_sessions"]["script"], "kill", sid],
-                       capture_output=True, text=True, timeout=15)
-    return (r.stdout.strip() or r.stderr.strip()
-            or f"killed {sid}")
+    return kill_session(cfg, sid)
 
 
 def t_tool_log(env, args, cfg, db):
@@ -450,7 +519,7 @@ TOOLS = [
          description="Saves an important fact to durable memory.",
          parameters={"type": "object", "properties": {
              "fact": {"type": "string"}}, "required": ["fact"]}),
-    dict(name="send_to", ring=0, fn=t_send_to,
+    dict(name="send_to", ring=0, fn=t_send_to, agent=True,
          description="Delivers a message to another channel (relay, "
                       "notification). Replies to the current speaker are "
                       "delivered automatically; send_to is for other channels "
@@ -488,7 +557,9 @@ TOOLS = [
                       "a managed Claude Code session on this host. The session "
                       "joins comms and reports to you on its own comms-v1 "
                       "channel as it works; {owner} can also "
-                      "drive it remotely. Never try to assign work by "
+                      "drive it remotely. Delegation is asynchronous: the "
+                      "worker's result arrives later as a new message in "
+                      "this conversation. Never try to assign work by "
                       "messaging an existing comms alias instead.",
          parameters={"type": "object", "properties": {
              "task": {"type": "string", "description": "the task, complete and self-contained"},
@@ -563,21 +634,26 @@ def available(cfg) -> list[dict]:
             if not t.get("requires") or enabled(cfg, t["requires"])]
 
 
+def _allowed(tool, tier: str) -> bool:
+    if tier == AGENT:
+        return bool(tool.get("agent"))
+    return tool["ring"] <= RING.get(tier, 0)
+
+
 def schema_for(tier: str, cfg) -> list[dict]:
     """Envelope-scoped tool exposure: below-ring tools aren't in the schema at all."""
-    rank = RING.get(tier, 0)
     return [{"type": "function", "name": t["name"],
              "description": t["description"].format(owner=cfg["owner_name"],
                                                     tz=cfg["timezone"]),
              "parameters": t["parameters"]}
-            for t in available(cfg) if t["ring"] <= rank]
+            for t in available(cfg) if _allowed(t, tier)]
 
 
 def execute(name: str, env: dict, args: dict, cfg, db) -> str:
     tool = next((t for t in available(cfg) if t["name"] == name), None)
     if tool is None:
         return f"unknown tool: {name}"
-    if RING.get(env["tier"], 0) < tool["ring"]:  # defense in depth
+    if not _allowed(tool, env["tier"]):  # defense in depth
         db.step(env["turn_id"], "policy_denial", channel=env["channel"],
                 tool=name, sender=env["sender"])
         return "denied by policy"
