@@ -596,11 +596,34 @@ class WorkerTests(Base):
     def test_transcript_writes_count_as_activity(self):
         w = self.worker()
         t0 = w["created_at"]
-        tr = os.path.join(self.tmp.name, "t.jsonl")
-        open(tr, "w").close()
-        os.utime(tr, (t0 + 5 * 3600, t0 + 5 * 3600))
+        tr = self.transcript(t0 + 5 * 3600)
         self.hook("cs-w1", "UserPromptSubmit", t0 + 1, transcript=tr)
         self.assertNotReaped(t0 + 5 * 3600 + self.IDLE - 1)
+
+    def test_a_transcript_touched_without_new_entries_is_not_activity(self):
+        """An idle Claude rewrites its transcript's metadata about hourly;
+        only a newer timestamped entry counts."""
+        w = self.worker()
+        t0 = w["created_at"]
+        tr = self.transcript(t0 + 1, mtime=t0 + 5 * 3600)
+        self.hook("cs-w1", "UserPromptSubmit", t0 + 1, transcript=tr)
+        self.brain.reap_idle(now=t0 + 1 + self.IDLE + 1)
+        self.wait_reaped()
+        self.assertEqual(self.killed, ["w1"])
+
+    def transcript(self, last, mtime=None):
+        from datetime import datetime, timezone
+        tr = os.path.join(self.tmp.name, "t.jsonl")
+        with open(tr, "w") as f:
+            f.write("partial line\n")
+            for t in (last - 60, last):
+                ts = datetime.fromtimestamp(t, timezone.utc).isoformat()
+                f.write(json.dumps({"type": "assistant", "timestamp":
+                                    ts.replace("+00:00", "Z")}) + "\n")
+            f.write(json.dumps({"type": "bridge-session"}) + "\n")
+        mtime = last if mtime is None else mtime
+        os.utime(tr, (mtime, mtime))
+        return tr
 
     def test_a_report_counts_as_activity_on_arrival(self):
         w = self.worker()

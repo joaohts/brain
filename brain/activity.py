@@ -5,8 +5,10 @@ Its activity comes from Claude Code hooks: scripts/claude-activity-hook.sh,
 registered in ~/.claude/settings.json, appends each event (prompt, tool
 call start and end, subagent, compaction, stop, permission request) to
 <state>/activity/<session_id>.log with the claude pid and its /proc
-starttime. The transcript's mtime counts too (Claude writes it as it works,
-including when no hook fires, e.g. streaming a reply). Looking at either is
+starttime. The transcript's latest entry counts too (Claude writes it as it
+works, including when no hook fires, e.g. streaming a reply). Its mtime does
+not: an idle Claude rewrites its transcript's metadata about hourly (remote
+control), which would keep every session alive forever. Looking at either is
 not activity.
 
 A tool whose PreToolUse has no PostToolUse yet is in flight: the session is
@@ -15,7 +17,7 @@ for hung).
 
 A session that has fired no hook yet (it predates the hook and has been
 idle since; running sessions do pick it up) is "legacy": its activity is
-the transcript's mtime and Claude's own status file
+the transcript's latest entry and Claude's own status file
 (~/.claude/sessions/<pid>.json, status busy counts like a tool in flight),
 and the clock never starts before the reaper first saw it, so the
 migration itself never ends one.
@@ -28,6 +30,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 
 TOOL_CAP = 24 * 3600   # a tool in flight longer than this is taken for hung
@@ -90,6 +93,31 @@ def _mtime(path: str) -> float:
         return 0.0
 
 
+TAIL = 256 * 1024   # how much of a transcript's end transcript_last reads
+
+
+def transcript_last(path: str, after: float = 0.0) -> float:
+    """Time of the transcript's latest timestamped entry (0 if none). Read
+    only when its mtime is past `after`: nothing written since can't be newer."""
+    if not path or _mtime(path) <= after:
+        return 0.0
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - TAIL))
+            lines = f.read().splitlines()
+    except OSError:
+        return 0.0
+    best = 0.0
+    for line in reversed(lines):
+        try:
+            ts = json.loads(line).get("timestamp")
+            t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except (ValueError, AttributeError, TypeError):
+            continue
+        best = max(best, t)
+    return best
+
+
 def read_log(path: str) -> Session | None:
     """The session a hook log describes (None if empty or unreadable)."""
     try:
@@ -125,7 +153,7 @@ def read_log(path: str) -> Session | None:
         return None
     s.pending_since = min(pending.values()) if pending else None
     s.sources.append("hooks")
-    tm = _mtime(s.transcript)
+    tm = transcript_last(s.transcript, s.last)
     if tm > s.last:
         s.last = tm
         s.sources.append("transcript")
@@ -183,7 +211,7 @@ def sessions(cfg, now: float | None = None, proc: str = "/proc",
             hits = glob.glob(os.path.join(claude_home, "projects", "*",
                                           f"{s.sid}.jsonl"))
             s.transcript = hits[0] if hits else ""
-        tm = _mtime(s.transcript)
+        tm = transcript_last(s.transcript, s.last)
         if tm > s.last:
             s.last, s.sources = tm, s.sources + ["transcript"]
         if reg.get("status") == "busy":
