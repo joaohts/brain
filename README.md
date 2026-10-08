@@ -273,9 +273,22 @@ runs and none of its tools are offered to the model.
   5. It ends with `connected as <jid>` or `timed out` (just ask again).
 
   The tool holds the turn while it waits, so other channels queue for up to
-  3 minutes. The sidecar's local endpoints, bound to `127.0.0.1` only:
-  `GET /status` → `{connected, jid, loggedOut}`, `GET /qr` → `{qr, text}`
-  (404 when paired), `POST /repair`, and `POST /send`.
+  3 minutes.
+- **Listening on/off** (freeing the number for your own use): ask the brain,
+  from WhatsApp, comms or the CLI, to turn WhatsApp off, optionally for N
+  minutes. Its `whatsapp_listen` tool (owner tier only) calls `POST /listen`.
+  Off closes the connection but keeps `wa/auth`, so turning it on needs no QR.
+  While off, nothing is read or answered, `POST /send` returns 503, and
+  `/repair` is refused. Messages sent to the number while it was off are
+  dropped when the connection comes back; they are never answered late. Asked
+  over WhatsApp, the confirmation is sent before the connection closes. After
+  that, only comms, the CLI or the timer can turn it back on. The state lives
+  in `data/wa-listen.json`, so a pause survives restarts.
+
+  The sidecar's local endpoints, bound to `127.0.0.1` only:
+  `GET /status` → `{connected, jid, loggedOut, listening, until}`,
+  `GET /qr` → `{qr, text}` (404 when paired), `POST /repair`,
+  `POST /listen` `{on, minutes?}`, and `POST /send`.
 
 ### comms (`[comms]`)
 

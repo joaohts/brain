@@ -46,6 +46,7 @@ def deliver(channel: str, message: str, origin: str, cfg, db,
     in the thread (e.g. a turn reply delivered to its origin)."""
     if channel.startswith("wpp:") and enabled(cfg, "whatsapp"):
         import json as _json
+        import urllib.error
         import urllib.request
         alias = channel.split(":", 1)[1]
         book = contacts(cfg)
@@ -59,6 +60,12 @@ def deliver(channel: str, message: str, origin: str, cfg, db,
         try:
             urllib.request.urlopen(req, timeout=15)
             status = "delivered on WhatsApp"
+        except urllib.error.HTTPError as e:   # e.g. 503 while listening is off
+            try:
+                why = _json.loads(e.read() or b"{}").get("error") or e
+            except ValueError:
+                why = e
+            status = f"WhatsApp unavailable: {why}"
         except Exception as e:
             status = f"WhatsApp unavailable: {e}"
         channel = f"wpp:{alias}"
@@ -684,14 +691,17 @@ WA_PAIR_TIMEOUT = 180  # s; QR codes rotate about every 20 s
 WA_PAIR_POLL = 3       # s
 
 
-def _wa_http(cfg, method: str, path: str, timeout: float = 10):
+def _wa_http(cfg, method: str, path: str, timeout: float = 10, body=None):
     """(status, json body) from the sidecar; (0, {"error": ...}) when unreachable."""
     import json as _json
     import urllib.error
     import urllib.request
+    data = None
+    if method == "POST":
+        data = _json.dumps(body).encode() if body is not None else b""
     req = urllib.request.Request(
         f"http://127.0.0.1:{cfg['whatsapp']['port']}{path}", method=method,
-        data=b"" if method == "POST" else None)
+        data=data, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, _json.loads(r.read() or b"{}")
@@ -750,6 +760,58 @@ def t_whatsapp_pair(env, args, cfg, db):
     db.step(env["turn_id"], "whatsapp_pair_timeout", channel=channel, qr_sent=sent)
     return (f"timed out after {WA_PAIR_TIMEOUT} s without a scan ({sent} QR "
             f"codes sent). Ask again to retry.")
+
+
+# -- WhatsApp listening on/off -------------------------------------------------
+# Frees the number for {owner}'s own use: the sidecar closes the connection
+# (creds kept, no QR to come back) and drops what arrives meanwhile. Asked over
+# WhatsApp, the reply still goes out first; turning it back on then has to come
+# from comms, the CLI, or the minutes timer.
+
+def _wa_listen_text(cfg, st: dict) -> str:
+    if st.get("listening", True):
+        return "WhatsApp listening is ON" + (
+            "" if st.get("connected", True) else " (not connected yet)")
+    until = st.get("until")
+    if not until:
+        return "WhatsApp listening is OFF until turned back on"
+    from zoneinfo import ZoneInfo
+    local = datetime.datetime.fromisoformat(until.replace("Z", "+00:00")).astimezone(
+        ZoneInfo(cfg["timezone"]))
+    return f"WhatsApp listening is OFF until {local:%Y-%m-%d %H:%M} ({cfg['timezone']})"
+
+
+def t_whatsapp_listen(env, args, cfg, db):
+    action = args.get("action")
+    http = _wa["http"]
+    if action == "status":
+        status, st = http(cfg, "GET", "/status")
+        if status != 200:
+            return (f"whatsapp status FAILED: sidecar returned {status} "
+                    f"{st.get('error', '')}. Is the brain-wa service running?").strip()
+        return _wa_listen_text(cfg, st)
+    if action not in ("on", "off"):
+        return "action must be on, off or status"
+    body = {"on": action == "on"}
+    minutes = args.get("minutes")
+    if action == "off" and minutes is not None:
+        if not isinstance(minutes, (int, float)) or minutes <= 0:
+            return "minutes must be a positive number (omit it to stay off until turned on)"
+        body["minutes"] = minutes
+    status, st = http(cfg, "POST", "/listen", body=body)
+    if status != 200:
+        return (f"whatsapp_listen FAILED: sidecar returned {status} "
+                f"{st.get('error', '')}. Is the brain-wa service running?").strip()
+    db.step(env["turn_id"], "whatsapp_listen", channel=env["channel"],
+            sender=env["sender"], on=body["on"], minutes=body.get("minutes"))
+    out = _wa_listen_text(cfg, st)
+    if action == "off":
+        out += (". Messages to the number are ignored meanwhile and nothing is "
+                "sent from it. It can only be turned back on from comms or the "
+                "CLI" + (", or by the timer" if st.get("until") else "") + ".")
+        if env["channel"].startswith("wpp:"):
+            out += " This reply is the last WhatsApp message before it goes off."
+    return out
 
 
 # -- vault (brain/vault.py) ------------------------------------------------------
@@ -935,6 +997,21 @@ TOOLS = [
                       "'timed out'. Works from the CLI or comms, not from "
                       "WhatsApp itself.",
          parameters={"type": "object", "properties": {}}),
+    dict(name="whatsapp_listen", ring=2, fn=t_whatsapp_listen, requires="whatsapp",
+         description="Turns your WhatsApp channel off so {owner} can use the "
+                      "number for other things, or back on, or reports its "
+                      "status. Off closes the connection (pairing kept, no QR "
+                      "to come back); messages sent to the number meanwhile "
+                      "are ignored, never answered later. Use minutes for a "
+                      "temporary off that turns itself back on; without it, "
+                      "it stays off until turned on. Turning it on only works "
+                      "from comms or the CLI, so say that when turning it off "
+                      "from WhatsApp.",
+         parameters={"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["off", "on", "status"]},
+             "minutes": {"type": "number",
+                         "description": "off only: turn back on after this long"}},
+             "required": ["action"]}),
     dict(name="calendar_read", ring=1, fn=t_calendar_read, requires="calendar",
          description="Reads {owner}'s real calendar (all calendars "
                       "merged, timezone {tz}). Returns JSON "

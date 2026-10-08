@@ -3,6 +3,9 @@
 //   inbound : self-chat (Notes to Self) + allowlisted DMs -> debounce ->
 //             POST BRAIN/turn (submit) -> poll -> reply into the same chat
 //   outbound: POST :3402/send {to: "self"|jid, text} (used by brain deliver())
+//   listening: POST :3402/listen {on, minutes?} (the brain's whatsapp_listen
+//             tool) closes or reopens the connection so the owner can use the
+//             number for other things; see "listening on/off" below.
 //
 // Auth state is Baileys useMultiFileAuthState in WA_AUTH (default ./auth).
 // With no session yet, a QR is printed to the log: scan it from the phone
@@ -26,6 +29,7 @@ import http from 'http';
 import pino from 'pino';
 import qrterm from 'qrcode-terminal';
 import { moveAuthAside } from './auth.js';
+import { loadPause, savePause, expired, inWindow } from './listen.js';
 
 const OPENAI_KEY = (() => {
   try {
@@ -66,7 +70,16 @@ let sock = null;
 
 // -- pairing state (served on GET /qr and GET /status, localhost only) -------
 const pairing = { qr: null, qrText: null, connected: false, jid: null, loggedOut: false };
-let generation = 0;              // bumps on /repair; stale sockets' events are ignored
+let generation = 0;              // bumps on /repair and on pause; stale sockets' events are ignored
+
+// -- listening on/off (state persisted, see listen.js) -------------------------
+const PAUSE_FILE = process.env.WA_LISTEN_STATE
+  || new URL('../data/wa-listen.json', import.meta.url).pathname;
+let pause = loadPause(PAUSE_FILE);   // null = listening
+let dropWindow = null;           // {from, to} ms: messages sent while off
+let resumeTimer = null;
+let inflight = 0;                // turns whose reply is still to be sent
+let closeWhenIdle = false;       // pause asked mid-turn: close after its reply
 
 function renderQr(qr) {
   let text = null;
@@ -128,8 +141,21 @@ async function flush(chatJid) {
   const buf = buffers.get(chatJid);
   buffers.delete(chatJid);
   if (!buf) return;
+  if (pause) { log(`[drop] paused: ${buf.texts.length} message(s) from ${buf.sender}`); return; }
   const text = buf.texts.join('\n');
   log(`[in] ${buf.sender}: ${text.slice(0, 80)}`);
+  inflight++;
+  try {
+    await answer(chatJid, buf, text);
+  } finally {
+    // a pause asked during this turn closes the connection after its reply
+    if (--inflight === 0 && closeWhenIdle) closeSocket();
+  }
+  log(`[timing] received -> answered in ${((Date.now() - buf.t0) / 1000).toFixed(1)}s`
+      + ` (includes ${DEBOUNCE_MS / 1000}s debounce)`);
+}
+
+async function answer(chatJid, buf, text) {
   const reply = await brainTurn({
     // one channel per PERSON, alias-keyed; numbers stay in allow.json
     channel: `wpp:${buf.alias}`,
@@ -141,8 +167,6 @@ async function flush(chatJid) {
     try { await send(resolveJid(chatJid), reply); }
     catch (e) { log(`[out] FAILED reply to ${chatJid}:`, e.message); }
   }
-  log(`[timing] received -> answered in ${((Date.now() - buf.t0) / 1000).toFixed(1)}s`
-      + ` (includes ${DEBOUNCE_MS / 1000}s debounce)`);
 }
 
 // -- media -> text (voice notes, images, PDFs feed the same envelope) ---------
@@ -267,6 +291,10 @@ async function connect() {
       const jid = m.key.remoteJid;
       if (!jid || jid.endsWith('@g.us')) continue;           // groups: deny
       if (m.key.fromMe) continue;                            // our own sends
+      if (pause) { log(`[drop] paused: ${jid}`); continue; }
+      if (inWindow(dropWindow, m.messageTimestamp)) {
+        log(`[drop] sent while paused: ${jid}`); continue;
+      }
       const who = ALLOW_FROM[jid];
       if (!who) { log(`[drop] non-allowlisted ${jid}`); continue; }
       const text = m.message?.conversation
@@ -339,6 +367,59 @@ async function repair() {
   return moved;
 }
 
+// -- listening on/off ------------------------------------------------------------
+// Off: the connection closes (creds stay, so on needs no QR), inbound is
+// dropped unread and /send refuses. A pause asked from a WhatsApp turn waits
+// for that turn's reply before closing. A timed pause turns itself back on;
+// either way it survives restarts.
+function closeSocket() {
+  closeWhenIdle = false;
+  try { sock?.end?.(new Error('listening off')); } catch {}
+  Object.assign(pairing, { connected: false, qr: null, qrText: null });
+  selfJid = null;
+  log('[listen] connection closed — the number is free');
+}
+
+function armResume() {
+  clearTimeout(resumeTimer);
+  resumeTimer = null;
+  if (!pause?.until) return;
+  // setTimeout caps at ~24.8 days; re-arm until the pause is really over
+  resumeTimer = setTimeout(() => (expired(pause) ? resumeListening('timer') : armResume()),
+    Math.min(Math.max(0, pause.until - Date.now()), 2 ** 31 - 1));
+}
+
+function pauseListening(minutes) {
+  const now = Date.now();
+  const wasOn = !pause;
+  pause = { pausedAt: pause?.pausedAt ?? now, until: minutes ? now + minutes * 60000 : null };
+  savePause(PAUSE_FILE, pause);
+  armResume();
+  log(`[listen] OFF ${pause.until ? `until ${new Date(pause.until).toISOString()}` : 'until turned on'}`);
+  if (!wasOn) return;
+  generation++;                                   // no reconnects from the old socket
+  if (inflight > 0) closeWhenIdle = true;
+  else closeSocket();
+}
+
+function resumeListening(by) {
+  if (!pause) return false;
+  dropWindow = { from: pause.pausedAt, to: Date.now() };
+  pause = null;
+  savePause(PAUSE_FILE, null);
+  armResume();
+  if (closeWhenIdle) closeSocket();               // resumed before the pause took hold
+  generation++;
+  log(`[listen] ON (${by}) — reconnecting`);
+  connect().catch(e => log('[listen] connect failed:', e));
+  return true;
+}
+
+function listenView() {
+  return { listening: !pause,
+           until: pause?.until ? new Date(pause.until).toISOString() : null };
+}
+
 function json(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
@@ -347,20 +428,40 @@ function json(res, code, obj) {
 http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/status') {
     return json(res, 200, { connected: pairing.connected, jid: pairing.jid,
-                            loggedOut: pairing.loggedOut });
+                            loggedOut: pairing.loggedOut, ...listenView() });
   }
   if (req.method === 'GET' && req.url === '/qr') {
     if (pairing.connected || !pairing.qr) return json(res, 404, { error: 'no QR (paired or not ready)' });
     return json(res, 200, { qr: pairing.qr, text: pairing.qrText });
   }
   if (req.method === 'POST' && req.url === '/repair') {
+    if (pause) return json(res, 409, { error: 'listening is off; turn it on before pairing' });
     try { return json(res, 200, { ok: true, moved_to: await repair() }); }
     catch (e) { return json(res, 500, { error: String(e) }); }
   }
-  if (req.method !== 'POST' || req.url !== '/send') { res.writeHead(404); return res.end(); }
+  if (req.method !== 'POST' || !['/send', '/listen'].includes(req.url)) {
+    res.writeHead(404); return res.end();
+  }
   let body = '';
   req.on('data', c => body += c);
   req.on('end', async () => {
+    if (req.url === '/listen') {
+      try {
+        const { on, minutes } = JSON.parse(body || '{}');
+        if (typeof on !== 'boolean') return json(res, 400, { error: 'on must be true or false' });
+        if (minutes !== undefined && minutes !== null
+            && !(Number.isFinite(minutes) && minutes > 0)) {
+          return json(res, 400, { error: 'minutes must be a positive number' });
+        }
+        if (on) resumeListening('request');
+        else pauseListening(minutes || null);
+        return json(res, 200, { ok: true, ...listenView() });
+      } catch (e) { return json(res, 500, { error: String(e) }); }
+    }
+    if (pause) {
+      return json(res, 503, { error: 'WhatsApp listening is off (owner pause'
+        + (pause.until ? ` until ${new Date(pause.until).toISOString()}` : '') + ')' });
+    }
     try {
       const { to, text } = JSON.parse(body);
       // to: contact alias ("alice"), bare number, or full jid -> always @lid
@@ -374,6 +475,15 @@ http.createServer(async (req, res) => {
     }
   });
 }).listen(PORT, '127.0.0.1', () => log(`endpoints on 127.0.0.1:${PORT}: `
-  + 'POST /send, GET /status, GET /qr, POST /repair'));
+  + 'POST /send, GET /status, GET /qr, POST /repair, POST /listen'));
 
-connect();
+if (expired(pause)) {                 // a timed pause ran out while we were down
+  dropWindow = { from: pause.pausedAt, to: pause.until };
+  pause = null;
+  savePause(PAUSE_FILE, null);
+}
+if (pause) {
+  armResume();
+  log(`[listen] starting OFF ${pause.until ? `until ${new Date(pause.until).toISOString()}`
+    : 'until turned on'} — not connecting`);
+} else connect();
