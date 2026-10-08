@@ -30,6 +30,7 @@ import pino from 'pino';
 import qrterm from 'qrcode-terminal';
 import { moveAuthAside } from './auth.js';
 import { loadPause, savePause, expired, inWindow } from './listen.js';
+import { refused, networkError, retrying } from './retry.js';
 
 const OPENAI_KEY = (() => {
   try {
@@ -88,13 +89,19 @@ function renderQr(qr) {
 }
 
 // -- brain bridge -------------------------------------------------------------
+// A brain restart mid-turn is ridden out (see retry.js): the submit is resent
+// only when it surely never arrived, or when provider_id makes a resend a
+// duplicate the brain recognises; polls are always safe to repeat.
 async function brainTurn(envelope, chatJid) {
-  const r = await fetch(`${BRAIN}/turn`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(envelope),
-  });
-  const { id } = await r.json();
   const deadline = Date.now() + POLL_MAX_MS;
+  const { id } = await retrying(async () => {
+    const r = await fetch(`${BRAIN}/turn`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(envelope),
+    });
+    return r.json();
+  }, { until: deadline, retryable: envelope.provider_id ? networkError : refused,
+       onRetry: (e, n) => n === 1 && log('[brain] unreachable, retrying submit:', e.cause?.code || e.message) });
   let typingTimer = null;
   const stopTyping = async () => {
     if (typingTimer) {
@@ -106,7 +113,13 @@ async function brainTurn(envelope, chatJid) {
   try {
     while (Date.now() < deadline) {
       await new Promise(res => setTimeout(res, POLL_MS));
-      const s = await (await fetch(`${BRAIN}/turn/${id}`)).json();
+      let s;
+      try { s = await (await fetch(`${BRAIN}/turn/${id}`)).json(); }
+      catch (e) {
+        if (!networkError(e)) throw e;
+        log(`[brain] poll ${id} failed (${e.cause?.code || e.message}), retrying`);
+        continue;
+      }
       // typing starts when the turn actually holds the lock, not while queued
       if (s.status === 'running' && !typingTimer && chatJid) {
         await sock.sendPresenceUpdate('composing', chatJid).catch(() => {});
@@ -147,6 +160,9 @@ async function flush(chatJid) {
   inflight++;
   try {
     await answer(chatJid, buf, text);
+  } catch (e) {
+    // never an unhandled rejection: that would take the sidecar down
+    log(`[in] FAILED turn for ${buf.sender}:`, e.cause?.code || e.message);
   } finally {
     // a pause asked during this turn closes the connection after its reply
     if (--inflight === 0 && closeWhenIdle) closeSocket();

@@ -1,4 +1,4 @@
-// node --test wa/   (no network, no WhatsApp connection)
+// node --test wa/*.test.mjs   (no network, no WhatsApp connection)
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';

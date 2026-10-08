@@ -1,5 +1,5 @@
 // Listening on/off for the sidecar. Kept free of Baileys so it can be tested
-// without opening a WhatsApp connection (node --test wa/).
+// without opening a WhatsApp connection (node --test wa/*.test.mjs).
 //
 // Off means the socket is closed (the linked-device creds stay, so turning it
 // back on needs no QR) and the owner has the number to themselves. The state

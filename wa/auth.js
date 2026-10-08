@@ -1,5 +1,5 @@
 // Auth-dir handling for re-pairing. Kept free of Baileys so it can be tested
-// without opening a WhatsApp connection (node --test wa/).
+// without opening a WhatsApp connection (node --test wa/*.test.mjs).
 import fs from 'fs';
 
 // Move the Baileys auth dir aside as <dir>.old-<timestamp>. Never deletes:

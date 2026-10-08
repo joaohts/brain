@@ -476,7 +476,7 @@ scripts/          claude-sessions.sh (tmux-managed Claude Code sessions),
                   brain-budget (spending caps CLI for agents)
 deploy/systemd/   unit templates rendered by install.sh
 examples/         identity.example.md
-tests/            python -m unittest discover tests  (sidecar: node --test wa/)
+tests/            python -m unittest discover tests  (sidecar: node --test wa/*.test.mjs)
 config.example.toml  .env.example  install.sh  run-brain.sh  run-wa.sh
 data/             created at runtime: db, memory, identity, logs (git-ignored)
 ```
