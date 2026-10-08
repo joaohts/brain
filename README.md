@@ -328,6 +328,17 @@ and its `/open-comms` skill. If a spawn can't come up (login expired, claude
 exited, no comms receiver), the tool returns `spawn FAILED: …` quickly instead
 of promising a follow-up.
 
+Restarting the brain leaves its sessions running. The tmux server is never
+left in `brain.service`, whose control-group KillMode would take it, and
+every session, down on a restart, including a worker that was deploying the
+brain. `create` starts a new server in its own transient
+`claude-tmux-*.scope`. A server already running inside `brain.service` is
+moved into one, with its pipe-pane loggers (tmux puts panes in their own
+`tmux-spawn-*.scope` already). `claude-sessions.sh isolate` does that move
+by hand; `CLAUDE_SESSIONS_ADOPT_FROM` lists other units to adopt from. Without a
+systemd user manager the server starts as before. Stopping a scope, or
+`tmux kill-server`, still ends every session.
+
 `idle_minutes` (default 480) is how long a worker may stay inactive before
 it is killed, whether or not it sent a `[FINAL]`. `0` kills a worker as soon
 as its `[FINAL]` reaches the origin; workers that never send one still time

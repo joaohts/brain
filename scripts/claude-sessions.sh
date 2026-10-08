@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # claude-sessions.sh — manage tmux-backed `claude` sessions on this host.
 #
-# Subcommands: create | list | kill | info
+# Subcommands: create | list | kill | info | isolate
 # Each session = a tmux session running `claude` in a chosen cwd with full perms.
 # Requires: tmux, the comms CLI (`comms claude`), Claude Code, and the
 # /open-comms skill that the comms installer provides; jq is optional.
@@ -20,6 +20,11 @@ Usage:
   $(basename "$0") list [--json]
   $(basename "$0") kill <session-id>
   $(basename "$0") info <session-id>
+  $(basename "$0") isolate
+
+isolate moves a tmux server started inside brain.service (or the units in
+\$CLAUDE_SESSIONS_ADOPT_FROM) into its own systemd scope, so restarting the
+brain leaves the sessions running. create does this on its own.
 
 Sources name who started the session (e.g. brain, manual).
 EOF
@@ -43,6 +48,102 @@ is_managed() {
 env_get() {
   local name="$1" var="$2"
   tmux show-environment -t "$name" "$var" 2>/dev/null | sed "s/^${var}=//"
+}
+
+# ---------- tmux server isolation ----------
+#
+# The first `tmux new-session` forks the tmux server, which inherits the
+# caller's cgroup. Called from brain.service, that put the server (and its
+# pipe-pane loggers) inside brain.service, so `systemctl --user restart brain`
+# (KillMode=control-group) took the server down and with it every managed
+# session, including a worker that was itself deploying the brain. Panes
+# already run in tmux's own tmux-spawn-*.scope; the server is what has to
+# leave. A new server is started in its own transient scope, and a server that
+# was already started inside a unit listed in ADOPT_FROM is moved to one.
+# brain.service keeps its control-group KillMode: whatever the brain itself
+# forks still goes with it.
+
+SCOPE_PREFIX="claude-tmux"
+ADOPT_FROM="${CLAUDE_SESSIONS_ADOPT_FROM:-brain.service}"   # space-separated globs
+
+have_user_systemd() {
+  command -v systemd-run >/dev/null 2>&1 &&
+    command -v busctl >/dev/null 2>&1 &&
+    systemctl --user show-environment >/dev/null 2>&1
+}
+
+server_pid() {
+  tmux display-message -p '#{pid}' 2>/dev/null || true
+}
+
+cgroup_of() {
+  sed -n 's/^0:://p' "/proc/$1/cgroup" 2>/dev/null
+}
+
+server_tree() {
+  # The server pid and its descendants that still share its cgroup (the
+  # pipe-pane loggers). Panes, in their own scopes, are left where they are.
+  local root="$1" cg
+  cg=$(cgroup_of "$root")
+  if [ -z "$cg" ]; then return 0; fi
+  ps -e -o pid=,ppid= | awk -v r="$root" '
+    { pp[$1] = $2 }
+    END { for (p in pp) { q = p
+            while (q > 1) { if (q == r) { print p; break } q = pp[q] } } }' |
+  while read -r p; do
+    if [ "$(cgroup_of "$p")" = "$cg" ]; then echo "$p"; fi
+  done
+}
+
+isolate_server() {
+  # Move a running tmux server out of an ADOPT_FROM unit into its own scope.
+  # Prints what it did; never fails the caller.
+  local pid cg leaf pat match=""
+  pid=$(server_pid)
+  [ -z "$pid" ] && { echo "no tmux server"; return 0; }
+  cg=$(cgroup_of "$pid")
+  leaf="${cg##*/}"
+  case "$leaf" in "$SCOPE_PREFIX"-*.scope) echo "already isolated: $leaf"; return 0 ;; esac
+  for pat in $ADOPT_FROM; do
+    # shellcheck disable=SC2254
+    case "$leaf" in $pat) match=1 ;; esac
+  done
+  [ -z "$match" ] && { echo "left alone: tmux server $pid in $leaf"; return 0; }
+  have_user_systemd || { echo "no systemd user manager: tmux server $pid stays in $leaf" >&2; return 0; }
+  local pids n unit
+  pids=$(server_tree "$pid" | sort -n | tr '\n' ' ')
+  n=$(echo "$pids" | wc -w)
+  unit="$SCOPE_PREFIX-$pid.scope"
+  # shellcheck disable=SC2086
+  if busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+       org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' \
+       "$unit" fail 3 \
+       PIDs au "$n" $pids \
+       CollectMode s inactive-or-failed \
+       Description s "tmux server for Claude sessions (adopted)" \
+       0 >/dev/null 2>&1; then
+    # The move happens when the job runs; wait for it so that loggers forked
+    # right after this (pipe-pane) land in the new scope too.
+    local i=0
+    while [ $i -lt 20 ] && [ "$(cgroup_of "$pid")" = "$cg" ]; do
+      sleep 0.1; i=$((i+1))
+    done
+    echo "adopted tmux server $pid ($n pids) from $leaf into $unit"
+  else
+    echo "could not move tmux server $pid out of $leaf" >&2
+  fi
+}
+
+new_session() {
+  # tmux new-session; when this starts the server, start it in its own scope.
+  if ! tmux list-sessions >/dev/null 2>&1 && have_user_systemd; then
+    systemd-run --user --scope --quiet --collect \
+      --unit="$SCOPE_PREFIX-$(date +%s)-$$" \
+      --description="tmux server for Claude sessions" \
+      -- tmux new-session "$@"
+  else
+    tmux new-session "$@"
+  fi
 }
 
 claude_alive() {
@@ -154,7 +255,8 @@ cmd_create() {
 
   pre_trust_cwd "$cwd"
 
-  tmux new-session -d -s "$id" -c "$cwd" -x 220 -y 50
+  new_session -d -s "$id" -c "$cwd" -x 220 -y 50
+  isolate_server >/dev/null
   tmux set-environment -t "$id" CLAUDE_SESSION_SOURCE "$source"
   tmux set-environment -t "$id" CLAUDE_SESSION_CWD "$cwd"
   tmux set-environment -t "$id" CLAUDE_SESSION_CREATED_AT "$created_at"
@@ -274,11 +376,15 @@ cmd_info() {
 EOF
 }
 
+# Sourcing the script (tests) only defines the functions.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+
 case "${1:-}" in
   create) shift; cmd_create "$@" ;;
   list)   shift; cmd_list "$@" ;;
   kill)   shift; cmd_kill "$@" ;;
   info)   shift; cmd_info "$@" ;;
+  isolate) isolate_server ;;
   -h|--help|help|"") usage; exit 0 ;;
   *) echo "unknown subcommand: $1" >&2; usage; exit 2 ;;
 esac
