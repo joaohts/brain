@@ -59,6 +59,26 @@ FINAL_MARK = "[FINAL]"
 DEFAULT_IDLE_MINUTES = 480   # [claude_sessions] idle_minutes when unset or 0
 REAP_EVERY = 60.0            # seconds between inactivity sweeps
 
+def _porter(kind: str, summary: str = "", error_kind: str = "") -> None:
+    """Report Joana to porter (comms) so she shows in João's Monitor app.
+    Fire-and-forget: never blocks or fails a turn."""
+    import datetime as _dt
+    import subprocess
+    args = [os.path.expanduser("~/.local/bin/comms"), "porter", "event",
+            "--agent", "joana", "--harness", "joana", "--title", "Joana",
+            "--project", "brain", "--kind", kind,
+            "--at", _dt.datetime.now(_dt.timezone.utc).isoformat()]
+    if summary:
+        args += ["--summary", summary[:120]]
+    if error_kind:
+        args += ["--error-kind", error_kind[:60]]
+    try:
+        subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS inbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -788,6 +808,7 @@ class Brain:
             self.store.renew_lease(self.holder, self.lease_seconds)
 
         reply, error = None, None
+        _porter("prompt", f"{head['kind'] or 'message'} on {head['channel']}")
         try:
             reply = _run(env, self.cfg, self.db, self.client(), pull=pull,
                          renew=renew, turn_id=turn_id)
@@ -795,6 +816,10 @@ class Brain:
             error = f"{type(e).__name__}: {e}"
             self.db.step(turn_id, "turn_error", channel=head["channel"],
                          error=error)
+        if error:
+            _porter("error", error_kind=error.split(":")[0])
+        else:
+            _porter("stop")
         for row in self.store.read_by(turn_id):
             is_head = row["id"] == head["id"]
             self._complete(row, reply if is_head else "", error, turn_id)
