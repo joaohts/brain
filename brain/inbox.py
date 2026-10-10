@@ -59,6 +59,34 @@ FINAL_MARK = "[FINAL]"
 DEFAULT_IDLE_MINUTES = 480   # [claude_sessions] idle_minutes when unset or 0
 REAP_EVERY = 60.0            # seconds between inactivity sweeps
 
+
+_PORTER_WHO: dict = {"at": 0.0, "map": {}}
+
+
+def _porter_who(head: dict) -> str:
+    """'João · WhatsApp' / 'personal-mac:notes · comms': who a turn answers,
+    with the channel to disambiguate. Comms ids resolve to addresses through
+    a cached `comms who` (5 min); anything unknown falls back to the raw id."""
+    import re
+    import subprocess
+    ch = head.get("channel") or ""
+    kind, _, rest = ch.partition(":")
+    if kind.startswith("comms"):
+        if time.time() - _PORTER_WHO["at"] > 300:
+            _PORTER_WHO["at"] = time.time()
+            try:
+                out = subprocess.run(
+                    [os.path.expanduser("~/.local/bin/comms"), "--compact", "who"],
+                    capture_output=True, text=True, timeout=3).stdout
+                _PORTER_WHO["map"] = {r["recipient"]: r["address"]
+                                      for r in json.loads(out or "[]")}
+            except Exception:
+                pass
+        return f"{_PORTER_WHO['map'].get(rest, rest)} · comms"
+    name = re.sub(r"\s*\([^)]*\)", "", head.get("sender") or rest).strip()
+    label = {"wpp": "WhatsApp", "voice": "voice", "cli": "cli"}.get(kind, kind or "?")
+    return f"{name or rest} · {label}"
+
 def _porter(kind: str, summary: str = "", error_kind: str = "") -> None:
     """Report Joana to porter (comms) so she shows in João's Monitor app.
     Fire-and-forget: never blocks or fails a turn."""
@@ -808,7 +836,8 @@ class Brain:
             self.store.renew_lease(self.holder, self.lease_seconds)
 
         reply, error = None, None
-        _porter("prompt", f"{head['kind'] or 'message'} on {head['channel']}")
+        who = _porter_who(head)
+        _porter("prompt", f"Answering {who}")
         try:
             reply = _run(env, self.cfg, self.db, self.client(), pull=pull,
                          renew=renew, turn_id=turn_id)
@@ -817,9 +846,9 @@ class Brain:
             self.db.step(turn_id, "turn_error", channel=head["channel"],
                          error=error)
         if error:
-            _porter("error", error_kind=error.split(":")[0])
+            _porter("error", f"Failed answering {who}", error_kind=error.split(":")[0])
         else:
-            _porter("stop")
+            _porter("stop", f"Last answered {who}")
         for row in self.store.read_by(turn_id):
             is_head = row["id"] == head["id"]
             self._complete(row, reply if is_head else "", error, turn_id)
