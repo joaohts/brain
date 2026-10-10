@@ -87,14 +87,40 @@ def _porter_who(head: dict) -> str:
     label = {"wpp": "WhatsApp", "voice": "voice", "cli": "cli"}.get(kind, kind or "?")
     return f"{name or rest} · {label}"
 
+PORTER_HEARTBEAT_EVERY = 60.0   # seconds; porter publishes at most one change/min
+
+
+def _porter_args(kind: str) -> list:
+    # --keep: Joana is a long-lived agent — porter never marks her stale and
+    # the app shows her idle/deactivated from heartbeats instead.
+    return [os.path.expanduser("~/.local/bin/comms"), "porter", "event",
+            "--agent", "joana", "--harness", "joana", "--title", "Joana",
+            "--project", "brain", "--kind", kind, "--keep"]
+
+
+def _spawn(args: list) -> None:
+    import subprocess
+    try:
+        subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def _porter_heartbeat(paused: bool) -> None:
+    """Liveness ping: the brain is up. paused = a spending cap stops new
+    turns (messages are held). Only refreshes heartbeat_at in porter; never
+    last_active_at or status. Fire-and-forget."""
+    _spawn(_porter_args("update") + ["--heartbeat",
+                                     "--paused", "true" if paused else "false"])
+
+
 def _porter(kind: str, summary: str = "", error_kind: str = "") -> None:
     """Report Joana to porter (comms) so she shows in João's Monitor app.
     Fire-and-forget: never blocks or fails a turn."""
     import datetime as _dt
     import subprocess
-    args = [os.path.expanduser("~/.local/bin/comms"), "porter", "event",
-            "--agent", "joana", "--harness", "joana", "--title", "Joana",
-            "--project", "brain", "--kind", kind,
+    args = _porter_args(kind) + [
             "--at", _dt.datetime.now(_dt.timezone.utc).isoformat()]
     if summary:
         args += ["--summary", summary[:120]]
@@ -592,6 +618,7 @@ class Brain:
         self.routes = {"http": None, "deliver": None}
         self.routes.update(routes or {})
         self._ticker = None
+        self._porter_hb = None
         self._stop = threading.Event()
         with _current_guard:
             _current = self
@@ -624,8 +651,38 @@ class Brain:
             self._ticker = threading.Thread(target=loop, daemon=True,
                                             name="inbox-ticker")
             self._ticker.start()
+        self.start_porter_heartbeat()
         self.kick()
         return self
+
+    def porter_paused(self) -> bool:
+        """A spending cap currently stops new turns (no model call)."""
+        try:
+            from . import budget
+            return budget.reached(self.cfg, self.db) is not None
+        except Exception:
+            return False
+
+    def porter_beat(self) -> None:
+        _porter_heartbeat(self.porter_paused())
+
+    def start_porter_heartbeat(self, every: float = PORTER_HEARTBEAT_EVERY):
+        """Ping porter now and every `every` seconds while the brain runs, so
+        the Monitor app shows Joana idle (up) or deactivated (down/paused).
+        Daemon thread; a failed ping is just skipped."""
+        if self._porter_hb is not None:
+            return
+        def loop():
+            while True:
+                try:
+                    self.porter_beat()
+                except Exception:
+                    pass
+                if self._stop.wait(every):
+                    return
+        self._porter_hb = threading.Thread(target=loop, daemon=True,
+                                           name="porter-heartbeat")
+        self._porter_hb.start()
 
     def stop(self):
         self._stop.set()
